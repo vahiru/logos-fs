@@ -1,4 +1,5 @@
 use std::cmp::Ordering;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -15,12 +16,14 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
-use crate::pb::{ArchiveRequest, ChatMessage, MessageMetadata, SearchRequest, SearchResult};
+use crate::pb::{ArchiveRequest, ChatMessage, MessageMetadata, SearchMode, SearchRequest, SearchResult};
 use crate::service::VfsError;
 
 const DEFAULT_LIMIT: usize = 2;
 const MAX_LIMIT: usize = 5;
+const MIN_ROWS_FOR_PQ_TRAINING: usize = 256;
 const LANCEDB_SESSIONS_TABLE: &str = "sessions";
+const LANCEDB_MSG_ID_TO_SESSION_ID_TABLE: &str = "msg_id_to_session_id";
 
 #[derive(Clone, Debug)]
 pub struct EmbeddingConfig {
@@ -45,6 +48,7 @@ struct StoredChatMessage {
     context: String,
     timestamp: i64,
     metadata: Option<StoredMessageMetadata>,
+    vector: Vec<f32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,6 +69,14 @@ struct SessionRecord {
     center_vector: Vec<f32>,
     abstract_summary: String,
     messages: Vec<StoredChatMessage>,
+    updated_at_unix: i64,
+}
+
+#[derive(Debug, Clone)]
+struct MsgIdMappingRecord {
+    msg_id: String,
+    session_id: String,
+    chat_id: String,
     updated_at_unix: i64,
 }
 
@@ -130,10 +142,18 @@ impl SessionsStore {
             .execute()
             .await
             .map_err(|e| VfsError::Lance(format!("insert session failed: {e}")))?;
+        self.sync_msg_id_mappings(&record).await?;
         Ok(())
     }
 
     pub async fn search(&self, req: SearchRequest) -> Result<Vec<SearchResult>, VfsError> {
+        match resolve_search_mode(req.mode) {
+            SearchMode::Exact => self.search_exact(req).await,
+            SearchMode::Semantic | SearchMode::Unspecified => self.search_semantic(req).await,
+        }
+    }
+
+    async fn search_semantic(&self, req: SearchRequest) -> Result<Vec<SearchResult>, VfsError> {
         if req.scope.trim().is_empty() {
             return Err(VfsError::InvalidRequest(
                 "scope(chat_id) cannot be empty".to_string(),
@@ -177,6 +197,52 @@ impl SessionsStore {
         }
         results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
         results.truncate(limit);
+        Ok(results)
+    }
+
+    async fn search_exact(&self, req: SearchRequest) -> Result<Vec<SearchResult>, VfsError> {
+        let msg_id = req.query.trim();
+        if msg_id.is_empty() {
+            return Err(VfsError::InvalidRequest(
+                "query(msg_id) cannot be empty in exact mode".to_string(),
+            ));
+        }
+
+        let _guard = self.lock.lock().await;
+        let mapping_table = self.open_or_create_msg_id_to_session_id_table().await?;
+        let Some(session_id) = self
+            .find_session_id_by_msg_id(&mapping_table, msg_id)
+            .await?
+        else {
+            return Ok(Vec::new());
+        };
+
+        let sessions_table = self.open_or_create_sessions_table().await?;
+        let mut filter = format!("session_id = '{}'", escape_sql_literal(&session_id));
+        if !req.scope.trim().is_empty() {
+            filter = format!(
+                "{} AND chat_id = '{}'",
+                filter,
+                escape_sql_literal(req.scope.trim())
+            );
+        }
+        let stream = sessions_table
+            .query()
+            .only_if(filter)
+            .limit(1)
+            .execute()
+            .await
+            .map_err(|e| VfsError::Lance(format!("execute exact query failed: {e}")))?;
+        let batches: Vec<RecordBatch> = stream
+            .try_collect()
+            .await
+            .map_err(|e| VfsError::Lance(format!("collect exact query results failed: {e}")))?;
+
+        let mut results = Vec::new();
+        for batch in batches {
+            results.extend(exact_results_from_batch(&batch)?);
+        }
+        results.truncate(1);
         Ok(results)
     }
 
@@ -240,6 +306,28 @@ impl SessionsStore {
         Ok(table)
     }
 
+    async fn open_or_create_msg_id_to_session_id_table(&self) -> Result<lancedb::Table, VfsError> {
+        let db = lancedb::connect(&self.lancedb_uri)
+            .execute()
+            .await
+            .map_err(|e| VfsError::Lance(format!("connect lancedb failed: {e}")))?;
+        if let Ok(table) = db
+            .open_table(LANCEDB_MSG_ID_TO_SESSION_ID_TABLE)
+            .execute()
+            .await
+        {
+            return Ok(table);
+        }
+
+        let empty_batch = self.build_empty_msg_id_mapping_batch()?;
+        let schema = empty_batch.schema();
+        let source = RecordBatchIterator::new(vec![Ok(empty_batch)].into_iter(), schema);
+        db.create_table(LANCEDB_MSG_ID_TO_SESSION_ID_TABLE, Box::new(source))
+            .execute()
+            .await
+            .map_err(|e| VfsError::Lance(format!("create msg_id_to_session_id table failed: {e}")))
+    }
+
     async fn ensure_vector_index(&self, table: &lancedb::Table) -> Result<(), VfsError> {
         let indices = table
             .list_indices()
@@ -249,6 +337,19 @@ impl SessionsStore {
             idx.columns.len() == 1 && idx.columns[0].as_str() == "center_vector"
         });
         if has_center_vector_index {
+            return Ok(());
+        }
+
+        let existing_rows = table
+            .query()
+            .limit(MIN_ROWS_FOR_PQ_TRAINING)
+            .execute()
+            .await
+            .map_err(|e| VfsError::Lance(format!("count rows for index failed: {e}")))?
+            .try_fold(0usize, |acc, batch| async move { Ok(acc + batch.num_rows()) })
+            .await
+            .map_err(|e| VfsError::Lance(format!("count rows for index failed: {e}")))?;
+        if existing_rows < MIN_ROWS_FOR_PQ_TRAINING {
             return Ok(());
         }
 
@@ -288,6 +389,20 @@ impl SessionsStore {
         .map_err(|e| VfsError::Lance(format!("build empty record batch failed: {e}")))
     }
 
+    fn build_empty_msg_id_mapping_batch(&self) -> Result<RecordBatch, VfsError> {
+        let schema = self.msg_id_mapping_schema();
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(Vec::<String>::new())),
+                Arc::new(StringArray::from(Vec::<String>::new())),
+                Arc::new(StringArray::from(Vec::<String>::new())),
+                Arc::new(Int64Array::from(Vec::<i64>::new())),
+            ],
+        )
+        .map_err(|e| VfsError::Lance(format!("build empty msg_id mapping batch failed: {e}")))
+    }
+
     fn build_session_batch(&self, record: &SessionRecord) -> Result<RecordBatch, VfsError> {
         let schema = self.sessions_schema()?;
         let messages_json = serde_json::to_string(&record.messages)
@@ -317,6 +432,30 @@ impl SessionsStore {
         .map_err(|e| VfsError::Lance(format!("build session record batch failed: {e}")))
     }
 
+    fn build_msg_id_mapping_batch(
+        &self,
+        records: &[MsgIdMappingRecord],
+    ) -> Result<RecordBatch, VfsError> {
+        let schema = self.msg_id_mapping_schema();
+        let msg_ids = records.iter().map(|r| r.msg_id.as_str()).collect::<Vec<_>>();
+        let session_ids = records
+            .iter()
+            .map(|r| r.session_id.as_str())
+            .collect::<Vec<_>>();
+        let chat_ids = records.iter().map(|r| r.chat_id.as_str()).collect::<Vec<_>>();
+        let updated_at = records.iter().map(|r| r.updated_at_unix).collect::<Vec<_>>();
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(msg_ids)),
+                Arc::new(StringArray::from(session_ids)),
+                Arc::new(StringArray::from(chat_ids)),
+                Arc::new(Int64Array::from(updated_at)),
+            ],
+        )
+        .map_err(|e| VfsError::Lance(format!("build msg_id mapping batch failed: {e}")))
+    }
+
     fn sessions_schema(&self) -> Result<Arc<Schema>, VfsError> {
         let dim = i32::try_from(self.embedding.dimension)
             .map_err(|e| VfsError::InvalidRequest(format!("invalid embedding dimension: {e}")))?;
@@ -336,6 +475,70 @@ impl SessionsStore {
             Field::new("updated_at_unix", DataType::Int64, false),
         ])))
     }
+
+    fn msg_id_mapping_schema(&self) -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("msg_id", DataType::Utf8, false),
+            Field::new("session_id", DataType::Utf8, false),
+            Field::new("chat_id", DataType::Utf8, false),
+            Field::new("updated_at_unix", DataType::Int64, false),
+        ]))
+    }
+
+    async fn sync_msg_id_mappings(&self, session: &SessionRecord) -> Result<(), VfsError> {
+        let mapping_table = self.open_or_create_msg_id_to_session_id_table().await?;
+        let delete_predicate = format!("session_id = '{}'", escape_sql_literal(&session.session_id));
+        mapping_table
+            .delete(&delete_predicate)
+            .await
+            .map_err(|e| VfsError::Lance(format!("delete old msg_id mappings failed: {e}")))?;
+
+        let mappings = build_msg_id_mapping_records(session)?;
+        if mappings.is_empty() {
+            return Ok(());
+        }
+
+        let batch = self.build_msg_id_mapping_batch(&mappings)?;
+        let schema = batch.schema();
+        let source = RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema);
+        mapping_table
+            .add(Box::new(source))
+            .execute()
+            .await
+            .map_err(|e| VfsError::Lance(format!("insert msg_id mappings failed: {e}")))?;
+        Ok(())
+    }
+
+    async fn find_session_id_by_msg_id(
+        &self,
+        mapping_table: &lancedb::Table,
+        msg_id: &str,
+    ) -> Result<Option<String>, VfsError> {
+        let filter = format!("msg_id = '{}'", escape_sql_literal(msg_id));
+        let stream = mapping_table
+            .query()
+            .only_if(filter)
+            .limit(1)
+            .execute()
+            .await
+            .map_err(|e| VfsError::Lance(format!("execute msg_id lookup failed: {e}")))?;
+        let batches: Vec<RecordBatch> = stream
+            .try_collect()
+            .await
+            .map_err(|e| VfsError::Lance(format!("collect msg_id lookup failed: {e}")))?;
+        for batch in batches {
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            let session_ids = downcast_utf8_column(&batch, "session_id")?;
+            return Ok(Some(session_ids.value(0).to_string()));
+        }
+        Ok(None)
+    }
+}
+
+fn resolve_search_mode(raw_mode: i32) -> SearchMode {
+    SearchMode::try_from(raw_mode).unwrap_or(SearchMode::Unspecified)
 }
 
 fn search_results_from_batch(batch: &RecordBatch, query_vec: &[f32]) -> Result<Vec<SearchResult>, VfsError> {
@@ -356,6 +559,28 @@ fn search_results_from_batch(batch: &RecordBatch, query_vec: &[f32]) -> Result<V
             abstract_summary: summaries.value(row).to_string(),
             messages: stored_messages.into_iter().map(pb_message_from_stored).collect(),
             score,
+        });
+    }
+    Ok(results)
+}
+
+fn exact_results_from_batch(batch: &RecordBatch) -> Result<Vec<SearchResult>, VfsError> {
+    let session_ids = downcast_utf8_column(batch, "session_id")?;
+    let vectors = downcast_fsl_column(batch, "center_vector")?;
+    let summaries = downcast_utf8_column(batch, "abstract_summary")?;
+    let messages_json = downcast_utf8_column(batch, "messages_json")?;
+
+    let mut results = Vec::with_capacity(batch.num_rows());
+    for row in 0..batch.num_rows() {
+        let center_vector = extract_vector(vectors, row)?;
+        let stored_messages: Vec<StoredChatMessage> = serde_json::from_str(messages_json.value(row))
+            .map_err(|e| VfsError::InvalidJson(format!("deserialize messages_json failed: {e}")))?;
+        results.push(SearchResult {
+            session_id: session_ids.value(row).to_string(),
+            center_vector,
+            abstract_summary: summaries.value(row).to_string(),
+            messages: stored_messages.into_iter().map(pb_message_from_stored).collect(),
+            score: 1.0,
         });
     }
     Ok(results)
@@ -435,6 +660,32 @@ fn escape_sql_literal(raw: &str) -> String {
     raw.replace('\'', "''")
 }
 
+fn build_msg_id_mapping_records(session: &SessionRecord) -> Result<Vec<MsgIdMappingRecord>, VfsError> {
+    let mut seen_msg_ids = HashSet::new();
+    let mut mappings = Vec::new();
+    for message in &session.messages {
+        let chat_id = if message.chat_id.trim().is_empty() {
+            session.chat_id.as_str()
+        } else {
+            message.chat_id.as_str()
+        };
+        let message_id = message.message_id.trim();
+        if chat_id.trim().is_empty() || message_id.is_empty() {
+            continue;
+        }
+        let msg_id = format!("{chat_id}:{message_id}");
+        if seen_msg_ids.insert(msg_id.clone()) {
+            mappings.push(MsgIdMappingRecord {
+                msg_id,
+                session_id: session.session_id.clone(),
+                chat_id: session.chat_id.clone(),
+                updated_at_unix: session.updated_at_unix,
+            });
+        }
+    }
+    Ok(mappings)
+}
+
 fn stored_message_from_pb(msg: ChatMessage) -> StoredChatMessage {
     StoredChatMessage {
         user_id: msg.user_id,
@@ -444,6 +695,7 @@ fn stored_message_from_pb(msg: ChatMessage) -> StoredChatMessage {
         context: msg.context,
         timestamp: msg.timestamp,
         metadata: msg.metadata.map(stored_metadata_from_pb),
+        vector: msg.vector,
     }
 }
 
@@ -456,6 +708,7 @@ fn pb_message_from_stored(msg: StoredChatMessage) -> ChatMessage {
         context: msg.context,
         timestamp: msg.timestamp,
         metadata: msg.metadata.map(pb_metadata_from_stored),
+        vector: msg.vector,
     }
 }
 
