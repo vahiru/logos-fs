@@ -45,24 +45,83 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_logos_memory_uri() {
-        let uri = parse_uri("logos://memory/groups/abc/messages/1").unwrap();
+    fn parse_single_message_uri() {
+        let uri = parse_uri("logos://memory/groups/abc/messages/42").unwrap();
         assert_eq!(uri.namespace, "memory");
-        assert_eq!(uri.path, vec!["groups", "abc", "messages", "1"]);
+        assert_eq!(uri.path, vec!["groups", "abc", "messages", "42"]);
     }
 
     #[test]
-    fn parse_logos_users_uri() {
-        let uri = parse_uri("logos://users/uid123/persona/short").unwrap();
+    fn parse_summary_short_latest() {
+        let uri = parse_uri("logos://memory/groups/gid/summary/short/latest").unwrap();
+        assert_eq!(uri.namespace, "memory");
+        assert_eq!(uri.path, vec!["groups", "gid", "summary", "short", "latest"]);
+    }
+
+    #[test]
+    fn parse_summary_short_date_hour() {
+        let uri = parse_uri("logos://memory/groups/gid/summary/short/2026-03-12T14").unwrap();
+        assert_eq!(uri.path[4], "2026-03-12T14");
+    }
+
+    #[test]
+    fn parse_summary_mid_date() {
+        let uri = parse_uri("logos://memory/groups/gid/summary/mid/2026-03-12").unwrap();
+        assert_eq!(uri.path[3], "mid");
+        assert_eq!(uri.path[4], "2026-03-12");
+    }
+
+    #[test]
+    fn parse_summary_long_year_month() {
+        let uri = parse_uri("logos://memory/groups/gid/summary/long/2026-03").unwrap();
+        assert_eq!(uri.path[3], "long");
+        assert_eq!(uri.path[4], "2026-03");
+    }
+
+    #[test]
+    fn parse_persona_long_md() {
+        let uri = parse_uri("logos://users/1234/persona/long.md").unwrap();
         assert_eq!(uri.namespace, "users");
-        assert_eq!(uri.path, vec!["uid123", "persona", "short"]);
+        assert_eq!(uri.path, vec!["1234", "persona", "long.md"]);
     }
 
     #[test]
-    fn parse_logos_system_uri() {
+    fn parse_persona_mid() {
+        let uri = parse_uri("logos://users/1234/persona/mid/").unwrap();
+        assert_eq!(uri.namespace, "users");
+        assert_eq!(uri.path, vec!["1234", "persona", "mid"]);
+    }
+
+    #[test]
+    fn parse_persona_short() {
+        let uri = parse_uri("logos://users/1234/persona/short/").unwrap();
+        assert_eq!(uri.path, vec!["1234", "persona", "short"]);
+    }
+
+    #[test]
+    fn parse_system_anchors() {
+        let uri = parse_uri("logos://system/anchors/task-001/2026-03-12T14:32:00").unwrap();
+        assert_eq!(uri.namespace, "system");
+        assert_eq!(uri.path, vec!["anchors", "task-001", "2026-03-12T14:32:00"]);
+    }
+
+    #[test]
+    fn parse_system_anchors_list() {
+        let uri = parse_uri("logos://system/anchors/task-001/").unwrap();
+        assert_eq!(uri.path, vec!["anchors", "task-001"]);
+    }
+
+    #[test]
+    fn parse_system_tasks() {
         let uri = parse_uri("logos://system/tasks").unwrap();
         assert_eq!(uri.namespace, "system");
         assert_eq!(uri.path, vec!["tasks"]);
+    }
+
+    #[test]
+    fn parse_system_task_description_write() {
+        let uri = parse_uri("logos://system/tasks/task-001/description").unwrap();
+        assert_eq!(uri.path, vec!["tasks", "task-001", "description"]);
     }
 
     #[test]
@@ -70,13 +129,6 @@ mod tests {
         let uri = parse_uri("mem://users/uid/preferences.json").unwrap();
         assert_eq!(uri.namespace, "users");
         assert_eq!(uri.path, vec!["uid", "preferences.json"]);
-    }
-
-    #[test]
-    fn parse_trailing_slashes() {
-        let uri = parse_uri("logos://memory/groups/abc/").unwrap();
-        assert_eq!(uri.namespace, "memory");
-        assert_eq!(uri.path, vec!["groups", "abc"]);
     }
 
     #[test]

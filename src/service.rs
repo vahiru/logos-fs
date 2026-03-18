@@ -87,132 +87,269 @@ impl MemoryVfsService {
         })
     }
 
+    // RFC 003 Section 3.1: Path-mapped reads
     async fn route_read(&self, uri: &crate::router::LogosUri) -> Result<String, VfsError> {
         match uri.namespace.as_str() {
-            "users" => {
-                let user_path = format!("mem://users/{}", uri.path.join("/"));
-                // Check if this is a persona read
-                if uri.path.len() >= 2 && uri.path[1] == "persona" {
-                    if let Some(ref ps) = self.persona_store {
-                        let user_id = &uri.path[0];
-                        let layer = uri.path.get(2).map(|s| s.as_str()).unwrap_or("long");
-                        let entries = match layer {
-                            "long" => ps.get_long(user_id).await?.into_iter().collect(),
-                            "mid" => ps.get_latest_mid(user_id).await?.into_iter().collect(),
-                            "short" => ps.list_short(user_id, "").await?,
-                            _ => return Err(VfsError::InvalidPath(format!("unknown persona layer: {layer}"))),
-                        };
-                        return Ok(serde_json::to_string(&entries.iter().map(|e| &e.content).collect::<Vec<_>>())
-                            .unwrap_or_else(|_| "[]".to_string()));
-                    }
-                    return Err(VfsError::InvalidRequest("persona store not initialized".to_string()));
+            "users" => self.route_read_users(uri).await,
+            "memory" => self.route_read_memory(uri).await,
+            "system" => self.route_read_system(uri).await,
+            _ => Err(VfsError::InvalidPath(format!("unknown namespace: {}", uri.namespace))),
+        }
+    }
+
+    // logos://users/{uid}/persona/{layer}
+    // logos://users/{uid}/persona/long.md
+    // logos://users/{uid}/{file}.json (legacy)
+    async fn route_read_users(&self, uri: &crate::router::LogosUri) -> Result<String, VfsError> {
+        if uri.path.len() >= 2 && uri.path[1] == "persona" {
+            let ps = self.persona_store.as_ref()
+                .ok_or_else(|| VfsError::InvalidRequest("persona store not initialized".to_string()))?;
+            let user_id = &uri.path[0];
+            let raw_layer = uri.path.get(2).map(|s| s.as_str()).unwrap_or("long.md");
+            let layer = raw_layer.strip_suffix(".md").unwrap_or(raw_layer);
+            return match layer {
+                "long" => {
+                    let entry = ps.get_long(user_id).await?;
+                    Ok(entry.map(|e| e.content).unwrap_or_default())
                 }
-                self.users.read(&user_path).await
+                "mid" => {
+                    let entry = ps.get_latest_mid(user_id).await?;
+                    Ok(entry
+                        .map(|e| serde_json::to_string(&serde_json::json!({
+                            "period": e.period, "content": e.content
+                        })).unwrap_or_default())
+                        .unwrap_or_else(|| "null".to_string()))
+                }
+                "short" => {
+                    let since = uri.path.get(3).map(|s| s.as_str()).unwrap_or("");
+                    let entries = ps.list_short(user_id, since).await?;
+                    Ok(serde_json::to_string(
+                        &entries.iter().map(|e| serde_json::json!({
+                            "period": e.period, "content": e.content
+                        })).collect::<Vec<_>>()
+                    ).unwrap_or_else(|_| "[]".to_string()))
+                }
+                _ => Err(VfsError::InvalidPath(format!("unknown persona layer: {layer}"))),
+            };
+        }
+        let user_path = format!("mem://users/{}", uri.path.join("/"));
+        self.users.read(&user_path).await
+    }
+
+    // RFC 003 Section 3.1:
+    //   logos://memory/groups/{gid}/messages/{msg_id}
+    //   logos://memory/groups/{gid}/summary/short/latest
+    //   logos://memory/groups/{gid}/summary/short/{date}T{hour}
+    //   logos://memory/groups/{gid}/summary/mid/{date}
+    //   logos://memory/groups/{gid}/summary/long/{year_month}
+    async fn route_read_memory(&self, uri: &crate::router::LogosUri) -> Result<String, VfsError> {
+        if uri.path.len() < 3 || uri.path[0] != "groups" {
+            return Err(VfsError::InvalidPath(
+                "memory path must be logos://memory/groups/{gid}/...".to_string(),
+            ));
+        }
+        let gid = &uri.path[1];
+        let resource = &uri.path[2];
+
+        match resource.as_str() {
+            "messages" => {
+                let msg_id_str = uri.path.get(3)
+                    .ok_or_else(|| VfsError::InvalidPath("missing msg_id".to_string()))?;
+                let msg_id: i64 = msg_id_str.parse()
+                    .map_err(|_| VfsError::InvalidPath(format!("invalid msg_id: {msg_id_str}")))?;
+                let msg = self.messages.get_message_by_id(gid, msg_id).await?;
+                Ok(msg
+                    .map(|m| serde_json::to_string(&serde_json::json!({
+                        "msg_id": m.msg_id, "ts": m.ts, "chat_id": m.chat_id,
+                        "speaker": m.speaker, "reply_to": m.reply_to,
+                        "text": m.text, "mentions": m.mentions,
+                    })).unwrap_or_default())
+                    .unwrap_or_else(|| "null".to_string()))
             }
-            "memory" => {
-                // logos://memory/groups/{gid}/summary/{layer}/{period}
-                if uri.path.len() >= 4 && uri.path[0] == "groups" && uri.path[2] == "summary" {
-                    let chat_id = &uri.path[1];
-                    let layer = &uri.path[3];
-                    let period = uri.path.get(4).map(|s| s.as_str()).unwrap_or("");
-                    let summary = if period.is_empty() {
-                        self.messages.get_latest_summary(chat_id, layer).await?
-                    } else {
-                        self.messages.get_summary(chat_id, layer, period).await?
-                    };
-                    return Ok(summary
-                        .map(|s| serde_json::to_string(&serde_json::json!({
-                            "id": s.id, "layer": s.layer,
-                            "period_start": s.period_start, "period_end": s.period_end,
-                            "content": s.content, "generated_at": s.generated_at,
+            "summary" => {
+                let layer = uri.path.get(3)
+                    .ok_or_else(|| VfsError::InvalidPath("missing summary layer".to_string()))?;
+                let period_key = uri.path.get(4).map(|s| s.as_str()).unwrap_or("latest");
+
+                let summary = if period_key == "latest" {
+                    self.messages.get_latest_summary(gid, layer).await?
+                } else {
+                    match layer.as_str() {
+                        "long" => {
+                            // RFC: period_start LIKE {year_month}%
+                            let results = self.messages
+                                .get_summaries_by_period_prefix(gid, "long", period_key)
+                                .await?;
+                            results.into_iter().next()
+                        }
+                        _ => {
+                            self.messages.get_summary(gid, layer, period_key).await?
+                        }
+                    }
+                };
+
+                Ok(summary
+                    .map(|s| serde_json::to_string(&serde_json::json!({
+                        "id": s.id, "layer": s.layer,
+                        "period_start": s.period_start, "period_end": s.period_end,
+                        "source_refs": s.source_refs, "content": s.content,
+                        "generated_at": s.generated_at,
+                    })).unwrap_or_default())
+                    .unwrap_or_else(|| "null".to_string()))
+            }
+            _ => Err(VfsError::InvalidPath(format!(
+                "unrecognized memory resource: {resource}"
+            ))),
+        }
+    }
+
+    // logos://system/tasks, logos://system/tasks/{task_id}
+    // logos://system/anchors/{task_id}/{anchor_id}
+    async fn route_read_system(&self, uri: &crate::router::LogosUri) -> Result<String, VfsError> {
+        let resource = uri.path.first().map(|s| s.as_str())
+            .ok_or_else(|| VfsError::InvalidPath("empty system path".to_string()))?;
+
+        match resource {
+            "tasks" => {
+                let ts = self.task_store.as_ref()
+                    .ok_or_else(|| VfsError::InvalidRequest("task store not initialized".to_string()))?;
+                if let Some(task_id) = uri.path.get(1) {
+                    let task = ts.get_task(task_id).await?;
+                    return Ok(task
+                        .map(|t| serde_json::to_string(&serde_json::json!({
+                            "task_id": t.task_id, "description": t.description,
+                            "workspace": t.workspace, "resource": t.resource,
+                            "status": t.status, "chat_id": t.chat_id,
+                            "trigger": t.trigger, "created_at": t.created_at,
                         })).unwrap_or_default())
                         .unwrap_or_else(|| "null".to_string()));
                 }
-                Err(VfsError::InvalidPath(format!("unrecognized memory path: {}", uri.path.join("/"))))
+                // RFC 002 Section 4.2: full task table
+                let tasks = ts.list_tasks(None, None).await?;
+                let task_json: Vec<_> = tasks.iter().map(|t| serde_json::json!({
+                    "task_id": t.task_id, "description": t.description,
+                    "workspace": t.workspace, "resource": t.resource,
+                    "status": t.status, "chat_id": t.chat_id,
+                    "trigger": t.trigger, "created_at": t.created_at,
+                })).collect();
+                Ok(serde_json::to_string(&serde_json::json!({ "tasks": task_json }))
+                    .unwrap_or_else(|_| r#"{"tasks":[]}"#.to_string()))
             }
-            "system" => {
-                if uri.path.first().map(|s| s.as_str()) == Some("tasks") {
-                    if let Some(ref ts) = self.task_store {
-                        if let Some(task_id) = uri.path.get(1) {
-                            let task = ts.get_task(task_id).await?;
-                            return Ok(task
-                                .map(|t| serde_json::to_string(&serde_json::json!({
-                                    "task_id": t.task_id, "description": t.description,
-                                    "status": t.status, "chat_id": t.chat_id,
-                                })).unwrap_or_default())
-                                .unwrap_or_else(|| "null".to_string()));
-                        }
-                        let tasks = ts.list_tasks(None, None).await?;
-                        return Ok(serde_json::to_string(&tasks.iter().map(|t| &t.task_id).collect::<Vec<_>>())
-                            .unwrap_or_else(|_| "[]".to_string()));
-                    }
-                    return Err(VfsError::InvalidRequest("task store not initialized".to_string()));
+            "anchors" => {
+                let a = self.anchor_store.as_ref()
+                    .ok_or_else(|| VfsError::InvalidRequest("anchor store not initialized".to_string()))?;
+                let task_id = uri.path.get(1)
+                    .ok_or_else(|| VfsError::InvalidPath("missing task_id for anchors".to_string()))?;
+                if let Some(anchor_id) = uri.path.get(2) {
+                    let anchor = a.get_anchor(task_id, anchor_id).await?;
+                    return Ok(anchor
+                        .map(|anc| serde_json::to_string(&serde_json::json!({
+                            "id": anc.id, "task_id": anc.task_id,
+                            "summary": anc.summary, "facts": anc.facts,
+                            "created_at": anc.created_at,
+                        })).unwrap_or_default())
+                        .unwrap_or_else(|| "null".to_string()));
                 }
-                if uri.path.first().map(|s| s.as_str()) == Some("anchors") {
-                    if let Some(ref a) = self.anchor_store {
-                        if let Some(task_id) = uri.path.get(1) {
-                            if let Some(anchor_id) = uri.path.get(2) {
-                                let anchor = a.get_anchor(task_id, anchor_id).await?;
-                                return Ok(anchor
-                                    .map(|a| serde_json::to_string(&serde_json::json!({
-                                        "id": a.id, "task_id": a.task_id,
-                                        "summary": a.summary, "facts": a.facts,
-                                    })).unwrap_or_default())
-                                    .unwrap_or_else(|| "null".to_string()));
-                            }
-                            let anchors = a.list_anchors(task_id).await?;
-                            return Ok(serde_json::to_string(&anchors.iter().map(|a| &a.id).collect::<Vec<_>>())
-                                .unwrap_or_else(|_| "[]".to_string()));
-                        }
-                    }
-                    return Err(VfsError::InvalidRequest("anchor store not initialized".to_string()));
-                }
-                Err(VfsError::InvalidPath(format!("unrecognized system path: {}", uri.path.join("/"))))
+                let anchors = a.list_anchors(task_id).await?;
+                let anchor_json: Vec<_> = anchors.iter().map(|anc| serde_json::json!({
+                    "id": anc.id, "task_id": anc.task_id,
+                    "summary": anc.summary, "facts": anc.facts,
+                    "created_at": anc.created_at,
+                })).collect();
+                Ok(serde_json::to_string(&anchor_json)
+                    .unwrap_or_else(|_| "[]".to_string()))
             }
-            _ => Err(VfsError::InvalidPath(format!("unknown namespace: {}", uri.namespace))),
+            _ => Err(VfsError::InvalidPath(format!("unrecognized system resource: {resource}"))),
         }
     }
 
     async fn route_write(&self, uri: &crate::router::LogosUri, content: &str) -> Result<(), VfsError> {
         match uri.namespace.as_str() {
-            "users" => {
-                if uri.path.len() >= 2 && uri.path[1] == "persona" {
-                    if let Some(ref ps) = self.persona_store {
-                        let user_id = &uri.path[0];
-                        let layer = uri.path.get(2).map(|s| s.as_str()).unwrap_or("short");
-                        let period = uri.path.get(3).map(|s| s.as_str()).unwrap_or("");
-                        return match layer {
-                            "short" => ps.append_short(user_id, period, content).await,
-                            "mid" => ps.write_mid(user_id, period, content).await,
-                            "long" => ps.write_long(user_id, content).await,
-                            _ => Err(VfsError::InvalidPath(format!("unknown persona layer: {layer}"))),
-                        };
-                    }
-                    return Err(VfsError::InvalidRequest("persona store not initialized".to_string()));
-                }
-                let user_path = format!("mem://users/{}", uri.path.join("/"));
-                self.users.write(&user_path, content).await
-            }
-            "system" => {
-                if uri.path.first().map(|s| s.as_str()) == Some("tasks") {
-                    if let Some(ref ts) = self.task_store {
-                        let task: serde_json::Value = serde_json::from_str(content)
-                            .map_err(|e| VfsError::InvalidJson(format!("invalid task JSON: {e}")))?;
-                        let new_task = crate::task_store::NewTask {
-                            task_id: task["task_id"].as_str().unwrap_or_default().to_string(),
-                            description: task["description"].as_str().unwrap_or_default().to_string(),
-                            workspace: task["workspace"].as_str().unwrap_or_default().to_string(),
-                            resource: task["resource"].as_str().unwrap_or_default().to_string(),
-                            chat_id: task["chat_id"].as_str().unwrap_or_default().to_string(),
-                            trigger: task["trigger"].as_str().unwrap_or("user").to_string(),
-                        };
-                        return ts.create_task(&new_task).await;
-                    }
-                    return Err(VfsError::InvalidRequest("task store not initialized".to_string()));
-                }
-                Err(VfsError::InvalidPath(format!("unrecognized system write path: {}", uri.path.join("/"))))
-            }
+            "users" => self.route_write_users(uri, content).await,
+            "memory" => self.route_write_memory(uri, content).await,
+            "system" => self.route_write_system(uri, content).await,
             _ => Err(VfsError::InvalidPath(format!("namespace {} does not support write", uri.namespace))),
+        }
+    }
+
+    // logos://users/{uid}/persona/{layer}[/{period}]
+    // logos://users/{uid}/{file}.json
+    async fn route_write_users(&self, uri: &crate::router::LogosUri, content: &str) -> Result<(), VfsError> {
+        if uri.path.len() >= 2 && uri.path[1] == "persona" {
+            let ps = self.persona_store.as_ref()
+                .ok_or_else(|| VfsError::InvalidRequest("persona store not initialized".to_string()))?;
+            let user_id = &uri.path[0];
+            let raw_layer = uri.path.get(2).map(|s| s.as_str()).unwrap_or("short");
+            let layer = raw_layer.strip_suffix(".md").unwrap_or(raw_layer);
+            let period = uri.path.get(3).map(|s| s.as_str()).unwrap_or("");
+            return match layer {
+                "short" => ps.append_short(user_id, period, content).await,
+                "mid" => ps.write_mid(user_id, period, content).await,
+                "long" => ps.write_long(user_id, content).await,
+                _ => Err(VfsError::InvalidPath(format!("unknown persona layer: {layer}"))),
+            };
+        }
+        let user_path = format!("mem://users/{}", uri.path.join("/"));
+        self.users.write(&user_path, content).await
+    }
+
+    // logos://memory/groups/{gid}/summary/{layer}/{period}
+    async fn route_write_memory(&self, uri: &crate::router::LogosUri, content: &str) -> Result<(), VfsError> {
+        if uri.path.len() < 5 || uri.path[0] != "groups" || uri.path[2] != "summary" {
+            return Err(VfsError::InvalidPath(
+                "memory write must target logos://memory/groups/{gid}/summary/{layer}/{period}".to_string(),
+            ));
+        }
+        let chat_id = &uri.path[1];
+        let layer = &uri.path[3];
+        let period = &uri.path[4];
+
+        let summary_val: serde_json::Value = serde_json::from_str(content)
+            .map_err(|e| VfsError::InvalidJson(format!("invalid summary JSON: {e}")))?;
+
+        let insert = crate::message_store::InsertSummary {
+            layer: layer.clone(),
+            period_start: period.clone(),
+            period_end: summary_val["period_end"].as_str().unwrap_or(period).to_string(),
+            source_refs: summary_val["source_refs"].as_str()
+                .or_else(|| serde_json::to_string(&summary_val["source_refs"]).ok().as_deref().map(|_| ""))
+                .map(|s| s.to_string())
+                .unwrap_or_default(),
+            content: summary_val["content"].as_str().unwrap_or(content).to_string(),
+        };
+        self.messages.insert_summary(chat_id, &insert).await?;
+        Ok(())
+    }
+
+    // logos://system/tasks, logos://system/tasks/{task_id}/description
+    async fn route_write_system(&self, uri: &crate::router::LogosUri, content: &str) -> Result<(), VfsError> {
+        let resource = uri.path.first().map(|s| s.as_str())
+            .ok_or_else(|| VfsError::InvalidPath("empty system path".to_string()))?;
+
+        match resource {
+            "tasks" => {
+                let ts = self.task_store.as_ref()
+                    .ok_or_else(|| VfsError::InvalidRequest("task store not initialized".to_string()))?;
+
+                // logos://system/tasks/{task_id}/description (RFC 002 Section 4.5)
+                if uri.path.len() >= 3 && uri.path[2] == "description" {
+                    return ts.update_description(&uri.path[1], content).await;
+                }
+
+                // logos://system/tasks -> create new task
+                let task: serde_json::Value = serde_json::from_str(content)
+                    .map_err(|e| VfsError::InvalidJson(format!("invalid task JSON: {e}")))?;
+                let new_task = crate::task_store::NewTask {
+                    task_id: task["task_id"].as_str().unwrap_or_default().to_string(),
+                    description: task["description"].as_str().unwrap_or_default().to_string(),
+                    workspace: task["workspace"].as_str().unwrap_or_default().to_string(),
+                    resource: task["resource"].as_str().unwrap_or_default().to_string(),
+                    chat_id: task["chat_id"].as_str().unwrap_or_default().to_string(),
+                    trigger: task["trigger"].as_str().unwrap_or("user_message").to_string(),
+                };
+                ts.create_task(&new_task).await
+            }
+            _ => Err(VfsError::InvalidPath(format!("unrecognized system write path: {resource}"))),
         }
     }
 
