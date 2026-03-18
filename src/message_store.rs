@@ -19,7 +19,7 @@ pub struct StoredMessage {
     pub ts: String,
     pub chat_id: String,
     pub speaker: String,
-    pub reply_to: String,
+    pub reply_to: Option<i64>,
     pub text: String,
     pub mentions: Vec<String>,
     pub session_id: String,
@@ -61,27 +61,21 @@ impl MessageStore {
             })?;
 
             {
-                let mut stmt = tx
+                let mut insert_stmt = tx
                     .prepare_cached(
                         "INSERT INTO messages (external_id, ts, chat_id, speaker, reply_to, text, mentions, session_id)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                         VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7)",
                     )
                     .map_err(|e| VfsError::Sqlite(format!("prepare insert failed: {e}")))?;
 
                 for msg in &messages {
                     let mentions_json = serde_json::to_string(&msg.mentions)
                         .unwrap_or_else(|_| "[]".to_string());
-                    let reply_to: Option<&str> = if msg.reply_to.is_empty() {
-                        None
-                    } else {
-                        Some(&msg.reply_to)
-                    };
-                    stmt.execute(rusqlite::params![
+                    insert_stmt.execute(rusqlite::params![
                         msg.external_id,
                         msg.ts,
                         msg.chat_id,
                         msg.speaker,
-                        reply_to,
                         msg.text,
                         mentions_json,
                         session_id,
@@ -90,11 +84,71 @@ impl MessageStore {
                 }
             }
 
+            // Second pass: resolve reply_to external_id -> internal msg_id (RFC 003 S2.1)
+            {
+                let mut resolve_stmt = tx
+                    .prepare_cached(
+                        "SELECT msg_id FROM messages WHERE chat_id = ?1 AND external_id = ?2 LIMIT 1",
+                    )
+                    .map_err(|e| VfsError::Sqlite(format!("prepare resolve failed: {e}")))?;
+                let mut update_stmt = tx
+                    .prepare_cached(
+                        "UPDATE messages SET reply_to = ?1 WHERE chat_id = ?2 AND external_id = ?3",
+                    )
+                    .map_err(|e| VfsError::Sqlite(format!("prepare update failed: {e}")))?;
+
+                for msg in &messages {
+                    if msg.reply_to.is_empty() {
+                        continue;
+                    }
+                    let resolved: Option<i64> = resolve_stmt
+                        .query_row(
+                            rusqlite::params![msg.chat_id, msg.reply_to],
+                            |row| row.get(0),
+                        )
+                        .ok();
+                    if let Some(ref_msg_id) = resolved {
+                        update_stmt
+                            .execute(rusqlite::params![ref_msg_id, msg.chat_id, msg.external_id])
+                            .map_err(|e| VfsError::Sqlite(format!("update reply_to failed: {e}")))?;
+                    }
+                }
+            }
+
             sync_fts_for_session(&tx, &session_id)?;
 
             tx.commit()
                 .map_err(|e| VfsError::Sqlite(format!("commit failed: {e}")))?;
             Ok(())
+        })
+        .await
+        .map_err(|e| VfsError::Io(format!("spawn_blocking join failed: {e}")))?
+    }
+
+    pub async fn get_message_by_id(
+        &self,
+        chat_id: &str,
+        msg_id: i64,
+    ) -> Result<Option<StoredMessage>, VfsError> {
+        let conn = self.get_connection(chat_id).await?;
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().map_err(|e| {
+                VfsError::Sqlite(format!("failed to acquire sqlite lock: {e}"))
+            })?;
+            let mut stmt = conn
+                .prepare_cached(
+                    "SELECT msg_id, external_id, ts, chat_id, speaker, reply_to, text, mentions, session_id
+                     FROM messages WHERE msg_id = ?1",
+                )
+                .map_err(|e| VfsError::Sqlite(format!("prepare failed: {e}")))?;
+            let mut rows = stmt
+                .query_map(rusqlite::params![msg_id], row_to_stored_message)
+                .map_err(|e| VfsError::Sqlite(format!("query failed: {e}")))?;
+            match rows.next() {
+                Some(Ok(m)) => Ok(Some(m)),
+                Some(Err(e)) => Err(VfsError::Sqlite(format!("read row failed: {e}"))),
+                None => Ok(None),
+            }
         })
         .await
         .map_err(|e| VfsError::Io(format!("spawn_blocking join failed: {e}")))?
@@ -276,12 +330,13 @@ fn init_schema(conn: &Connection) -> Result<(), VfsError> {
            ts           TEXT NOT NULL,
            chat_id      TEXT NOT NULL,
            speaker      TEXT NOT NULL,
-           reply_to     TEXT,
+           reply_to     INTEGER REFERENCES messages(msg_id),
            text         TEXT NOT NULL,
            mentions     TEXT,
            session_id   TEXT NOT NULL
          );
          CREATE INDEX IF NOT EXISTS idx_messages_chat_ts ON messages(chat_id, ts);
+         CREATE INDEX IF NOT EXISTS idx_messages_reply_to ON messages(reply_to);
          CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);
          CREATE INDEX IF NOT EXISTS idx_messages_external ON messages(chat_id, external_id);
 
@@ -327,7 +382,7 @@ fn row_to_stored_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredMess
         ts: row.get(2)?,
         chat_id: row.get(3)?,
         speaker: row.get(4)?,
-        reply_to: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
+        reply_to: row.get::<_, Option<i64>>(5)?,
         text: row.get(6)?,
         mentions,
         session_id: row.get(8)?,
@@ -339,6 +394,337 @@ fn collect_rows(
 ) -> Result<Vec<StoredMessage>, VfsError> {
     rows.collect::<Result<Vec<_>, _>>()
         .map_err(|e| VfsError::Sqlite(format!("read rows failed: {e}")))
+}
+
+// --- Summary types and methods ---
+
+#[derive(Debug, Clone)]
+pub struct Summary {
+    pub id: i64,
+    pub chat_id: String,
+    pub layer: String,
+    pub period_start: String,
+    pub period_end: String,
+    pub source_refs: String,
+    pub content: String,
+    pub generated_at: String,
+}
+
+pub struct InsertSummary {
+    pub layer: String,
+    pub period_start: String,
+    pub period_end: String,
+    pub source_refs: String,
+    pub content: String,
+}
+
+impl MessageStore {
+    pub async fn insert_summary(
+        &self,
+        chat_id: &str,
+        summary: &InsertSummary,
+    ) -> Result<i64, VfsError> {
+        let conn = self.get_connection(chat_id).await?;
+        let chat_id = chat_id.to_string();
+        let layer = summary.layer.clone();
+        let period_start = summary.period_start.clone();
+        let period_end = summary.period_end.clone();
+        let source_refs = summary.source_refs.clone();
+        let content = summary.content.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let conn = conn
+                .lock()
+                .map_err(|e| VfsError::Sqlite(format!("lock failed: {e}")))?;
+            let now = now_iso8601();
+            conn.execute(
+                "INSERT INTO summaries (chat_id, layer, period_start, period_end, source_refs, content, generated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![chat_id, layer, period_start, period_end, source_refs, content, now],
+            )
+            .map_err(|e| VfsError::Sqlite(format!("insert summary failed: {e}")))?;
+            Ok(conn.last_insert_rowid())
+        })
+        .await
+        .map_err(|e| VfsError::Io(format!("spawn_blocking join failed: {e}")))?
+    }
+
+    pub async fn get_summary(
+        &self,
+        chat_id: &str,
+        layer: &str,
+        period_start: &str,
+    ) -> Result<Option<Summary>, VfsError> {
+        let conn = self.get_connection(chat_id).await?;
+        let layer = layer.to_string();
+        let period_start = period_start.to_string();
+
+        tokio::task::spawn_blocking(move || {
+            let conn = conn
+                .lock()
+                .map_err(|e| VfsError::Sqlite(format!("lock failed: {e}")))?;
+            let mut stmt = conn
+                .prepare_cached(
+                    "SELECT id, chat_id, layer, period_start, period_end, source_refs, content, generated_at
+                     FROM summaries WHERE layer = ?1 AND period_start = ?2
+                     ORDER BY id DESC LIMIT 1",
+                )
+                .map_err(|e| VfsError::Sqlite(format!("prepare failed: {e}")))?;
+            let mut rows = stmt
+                .query_map(rusqlite::params![layer, period_start], row_to_summary)
+                .map_err(|e| VfsError::Sqlite(format!("query failed: {e}")))?;
+            match rows.next() {
+                Some(Ok(s)) => Ok(Some(s)),
+                Some(Err(e)) => Err(VfsError::Sqlite(format!("read row failed: {e}"))),
+                None => Ok(None),
+            }
+        })
+        .await
+        .map_err(|e| VfsError::Io(format!("spawn_blocking join failed: {e}")))?
+    }
+
+    pub async fn get_latest_summary(
+        &self,
+        chat_id: &str,
+        layer: &str,
+    ) -> Result<Option<Summary>, VfsError> {
+        let conn = self.get_connection(chat_id).await?;
+        let layer = layer.to_string();
+
+        tokio::task::spawn_blocking(move || {
+            let conn = conn
+                .lock()
+                .map_err(|e| VfsError::Sqlite(format!("lock failed: {e}")))?;
+            let mut stmt = conn
+                .prepare_cached(
+                    "SELECT id, chat_id, layer, period_start, period_end, source_refs, content, generated_at
+                     FROM summaries WHERE layer = ?1
+                     ORDER BY period_start DESC LIMIT 1",
+                )
+                .map_err(|e| VfsError::Sqlite(format!("prepare failed: {e}")))?;
+            let mut rows = stmt
+                .query_map(rusqlite::params![layer], row_to_summary)
+                .map_err(|e| VfsError::Sqlite(format!("query failed: {e}")))?;
+            match rows.next() {
+                Some(Ok(s)) => Ok(Some(s)),
+                Some(Err(e)) => Err(VfsError::Sqlite(format!("read row failed: {e}"))),
+                None => Ok(None),
+            }
+        })
+        .await
+        .map_err(|e| VfsError::Io(format!("spawn_blocking join failed: {e}")))?
+    }
+
+    pub async fn get_summaries_by_period_prefix(
+        &self,
+        chat_id: &str,
+        layer: &str,
+        prefix: &str,
+    ) -> Result<Vec<Summary>, VfsError> {
+        let conn = self.get_connection(chat_id).await?;
+        let layer = layer.to_string();
+        let pattern = format!("{prefix}%");
+
+        tokio::task::spawn_blocking(move || {
+            let conn = conn
+                .lock()
+                .map_err(|e| VfsError::Sqlite(format!("lock failed: {e}")))?;
+            let mut stmt = conn
+                .prepare_cached(
+                    "SELECT id, chat_id, layer, period_start, period_end, source_refs, content, generated_at
+                     FROM summaries WHERE layer = ?1 AND period_start LIKE ?2
+                     ORDER BY period_start DESC",
+                )
+                .map_err(|e| VfsError::Sqlite(format!("prepare failed: {e}")))?;
+            let rows = stmt
+                .query_map(rusqlite::params![layer, pattern], row_to_summary)
+                .map_err(|e| VfsError::Sqlite(format!("query failed: {e}")))?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| VfsError::Sqlite(format!("read rows failed: {e}")))
+        })
+        .await
+        .map_err(|e| VfsError::Io(format!("spawn_blocking join failed: {e}")))?
+    }
+
+    pub async fn list_summaries(
+        &self,
+        chat_id: &str,
+        layer: &str,
+        start: Option<&str>,
+        end: Option<&str>,
+        limit: i32,
+    ) -> Result<Vec<Summary>, VfsError> {
+        let conn = self.get_connection(chat_id).await?;
+        let layer = layer.to_string();
+        let start = start.map(|s| s.to_string());
+        let end = end.map(|s| s.to_string());
+        let limit = clamp(limit, 1, 50, 200);
+
+        tokio::task::spawn_blocking(move || {
+            let conn = conn
+                .lock()
+                .map_err(|e| VfsError::Sqlite(format!("lock failed: {e}")))?;
+
+            let (sql, params) = build_list_summaries_query(&layer, &start, &end, limit);
+            let mut stmt = conn
+                .prepare(&sql)
+                .map_err(|e| VfsError::Sqlite(format!("prepare failed: {e}")))?;
+            let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                params.iter().map(|p| p.as_ref()).collect();
+            let rows = stmt
+                .query_map(param_refs.as_slice(), row_to_summary)
+                .map_err(|e| VfsError::Sqlite(format!("query failed: {e}")))?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| VfsError::Sqlite(format!("read rows failed: {e}")))
+        })
+        .await
+        .map_err(|e| VfsError::Io(format!("spawn_blocking join failed: {e}")))?
+    }
+
+    pub async fn delete_summaries_before(
+        &self,
+        chat_id: &str,
+        layer: &str,
+        before: &str,
+    ) -> Result<usize, VfsError> {
+        let conn = self.get_connection(chat_id).await?;
+        let layer = layer.to_string();
+        let before = before.to_string();
+
+        tokio::task::spawn_blocking(move || {
+            let conn = conn
+                .lock()
+                .map_err(|e| VfsError::Sqlite(format!("lock failed: {e}")))?;
+            conn.execute(
+                "DELETE FROM summaries WHERE layer = ?1 AND period_start < ?2",
+                rusqlite::params![layer, before],
+            )
+            .map_err(|e| VfsError::Sqlite(format!("delete summaries failed: {e}")))
+        })
+        .await
+        .map_err(|e| VfsError::Io(format!("spawn_blocking join failed: {e}")))?
+    }
+
+    pub async fn get_messages_by_ts_range(
+        &self,
+        chat_id: &str,
+        ts_start: &str,
+        ts_end: &str,
+    ) -> Result<Vec<StoredMessage>, VfsError> {
+        let conn = self.get_connection(chat_id).await?;
+        let ts_start = ts_start.to_string();
+        let ts_end = ts_end.to_string();
+
+        tokio::task::spawn_blocking(move || {
+            let conn = conn
+                .lock()
+                .map_err(|e| VfsError::Sqlite(format!("lock failed: {e}")))?;
+            let mut stmt = conn
+                .prepare_cached(
+                    "SELECT msg_id, external_id, ts, chat_id, speaker, reply_to, text, mentions, session_id
+                     FROM messages WHERE ts >= ?1 AND ts < ?2 ORDER BY msg_id ASC",
+                )
+                .map_err(|e| VfsError::Sqlite(format!("prepare failed: {e}")))?;
+            let rows = stmt
+                .query_map(rusqlite::params![ts_start, ts_end], row_to_stored_message)
+                .map_err(|e| VfsError::Sqlite(format!("query failed: {e}")))?;
+            collect_rows(rows)
+        })
+        .await
+        .map_err(|e| VfsError::Io(format!("spawn_blocking join failed: {e}")))?
+    }
+
+    pub fn list_chat_ids(&self) -> Result<Vec<String>, VfsError> {
+        let mut ids = Vec::new();
+        let entries = std::fs::read_dir(&self.db_root)
+            .map_err(|e| VfsError::Io(format!("read db_root failed: {e}")))?;
+        for entry in entries {
+            let entry = entry.map_err(|e| VfsError::Io(format!("read entry failed: {e}")))?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if let Some(chat_id) = name.strip_suffix(".db") {
+                if !chat_id.is_empty() {
+                    ids.push(chat_id.to_string());
+                }
+            }
+        }
+        Ok(ids)
+    }
+}
+
+fn row_to_summary(row: &rusqlite::Row<'_>) -> rusqlite::Result<Summary> {
+    Ok(Summary {
+        id: row.get(0)?,
+        chat_id: row.get(1)?,
+        layer: row.get(2)?,
+        period_start: row.get(3)?,
+        period_end: row.get(4)?,
+        source_refs: row.get(5)?,
+        content: row.get(6)?,
+        generated_at: row.get(7)?,
+    })
+}
+
+fn build_list_summaries_query(
+    layer: &str,
+    start: &Option<String>,
+    end: &Option<String>,
+    limit: i32,
+) -> (String, Vec<Box<dyn rusqlite::types::ToSql>>) {
+    let mut conditions = vec!["layer = ?1".to_string()];
+    let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(layer.to_string())];
+
+    if let Some(s) = start {
+        params.push(Box::new(s.clone()));
+        conditions.push(format!("period_start >= ?{}", params.len()));
+    }
+    if let Some(e) = end {
+        params.push(Box::new(e.clone()));
+        conditions.push(format!("period_start <= ?{}", params.len()));
+    }
+    params.push(Box::new(limit));
+    let sql = format!(
+        "SELECT id, chat_id, layer, period_start, period_end, source_refs, content, generated_at
+         FROM summaries WHERE {} ORDER BY period_start DESC LIMIT ?{}",
+        conditions.join(" AND "),
+        params.len()
+    );
+    (sql, params)
+}
+
+pub fn now_iso8601_pub() -> String {
+    now_iso8601()
+}
+
+fn now_iso8601() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let days = secs / 86400;
+    let tod = secs % 86400;
+    let (y, mo, d) = civil_from_days_u(days as i64);
+    format!(
+        "{y:04}-{mo:02}-{d:02}T{:02}:{:02}:{:02}Z",
+        tod / 3600,
+        (tod % 3600) / 60,
+        tod % 60,
+    )
+}
+
+pub fn civil_from_days_u(days: i64) -> (i32, u32, u32) {
+    let z = days + 719468;
+    let era = (if z >= 0 { z } else { z - 146096 }) / 146097;
+    let doe = (z - era * 146097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y as i32, m, d)
 }
 
 fn clamp(value: i32, min: i32, default: i32, max: i32) -> i32 {
@@ -516,5 +902,139 @@ mod tests {
 
         let err = store.search_fts("chat-1", "  ", 10).await;
         assert!(err.is_err());
+    }
+
+    #[tokio::test]
+    async fn summary_crud() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = make_test_store(tmp.path());
+
+        let s = InsertSummary {
+            layer: "short".to_string(),
+            period_start: "2026-03-18T14".to_string(),
+            period_end: "2026-03-18T15".to_string(),
+            source_refs: "[[1,50]]".to_string(),
+            content: "Summary of hour 14.".to_string(),
+        };
+        let id = store.insert_summary("chat-1", &s).await.unwrap();
+        assert!(id > 0);
+
+        let fetched = store
+            .get_summary("chat-1", "short", "2026-03-18T14")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(fetched.content, "Summary of hour 14.");
+        assert_eq!(fetched.id, id);
+    }
+
+    #[tokio::test]
+    async fn summary_get_latest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = make_test_store(tmp.path());
+
+        for hour in 10..15 {
+            store
+                .insert_summary(
+                    "chat-1",
+                    &InsertSummary {
+                        layer: "short".to_string(),
+                        period_start: format!("2026-03-18T{hour:02}"),
+                        period_end: format!("2026-03-18T{:02}", hour + 1),
+                        source_refs: "[]".to_string(),
+                        content: format!("Hour {hour}"),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        let latest = store
+            .get_latest_summary("chat-1", "short")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(latest.period_start, "2026-03-18T14");
+    }
+
+    #[tokio::test]
+    async fn summary_list_with_range() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = make_test_store(tmp.path());
+
+        for hour in 10..20 {
+            store
+                .insert_summary(
+                    "chat-1",
+                    &InsertSummary {
+                        layer: "short".to_string(),
+                        period_start: format!("2026-03-18T{hour:02}"),
+                        period_end: format!("2026-03-18T{:02}", hour + 1),
+                        source_refs: "[]".to_string(),
+                        content: format!("Hour {hour}"),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        let results = store
+            .list_summaries("chat-1", "short", Some("2026-03-18T12"), Some("2026-03-18T16"), 50)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 5);
+    }
+
+    #[tokio::test]
+    async fn summary_delete_before() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = make_test_store(tmp.path());
+
+        for hour in 10..15 {
+            store
+                .insert_summary(
+                    "chat-1",
+                    &InsertSummary {
+                        layer: "short".to_string(),
+                        period_start: format!("2026-03-18T{hour:02}"),
+                        period_end: format!("2026-03-18T{:02}", hour + 1),
+                        source_refs: "[]".to_string(),
+                        content: format!("Hour {hour}"),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        let deleted = store
+            .delete_summaries_before("chat-1", "short", "2026-03-18T13")
+            .await
+            .unwrap();
+        assert_eq!(deleted, 3);
+
+        let remaining = store
+            .list_summaries("chat-1", "short", None, None, 50)
+            .await
+            .unwrap();
+        assert_eq!(remaining.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn list_chat_ids_returns_db_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = make_test_store(tmp.path());
+
+        store
+            .insert_messages("group-a", "s1", &make_messages(1, "group-a"))
+            .await
+            .unwrap();
+        store
+            .insert_messages("group-b", "s1", &make_messages(1, "group-b"))
+            .await
+            .unwrap();
+
+        let mut ids = store.list_chat_ids().unwrap();
+        ids.sort();
+        assert_eq!(ids, vec!["group-a", "group-b"]);
     }
 }

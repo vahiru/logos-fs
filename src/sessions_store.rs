@@ -12,10 +12,10 @@ use arrow_schema::{DataType, Field, Schema};
 use futures_util::TryStreamExt;
 use lancedb::index::Index;
 use lancedb::query::{ExecutableQuery, QueryBase};
-use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
+use crate::embedding::EmbeddingProvider;
 use crate::message_store::{InsertMessage, MessageStore};
 use crate::pb::{
     ArchiveRequest, ChatMessage, MessageMetadata, SearchMode, SearchRequest, SearchResult,
@@ -28,17 +28,9 @@ const MIN_ROWS_FOR_PQ_TRAINING: usize = 256;
 const LANCEDB_SESSIONS_TABLE: &str = "sessions";
 const LANCEDB_MSG_ID_TO_SESSION_ID_TABLE: &str = "msg_id_to_session_id";
 
-#[derive(Clone, Debug)]
-pub struct EmbeddingConfig {
-    pub base_url: String,
-    pub model: String,
-    pub dimension: usize,
-}
-
 pub struct SessionsStore {
     lancedb_uri: String,
-    embedding: EmbeddingConfig,
-    http_client: Client,
+    embedder: Arc<dyn EmbeddingProvider>,
     lock: RwLock<()>,
     message_store: Arc<MessageStore>,
 }
@@ -84,21 +76,15 @@ struct MsgIdMappingRecord {
     updated_at_unix: i64,
 }
 
-#[derive(Debug, Deserialize)]
-struct OllamaEmbedResponse {
-    embedding: Option<Vec<f32>>,
-}
-
 impl SessionsStore {
     pub fn new(
         lancedb_uri: String,
-        embedding: EmbeddingConfig,
+        embedder: Arc<dyn EmbeddingProvider>,
         message_store: Arc<MessageStore>,
     ) -> Self {
         Self {
             lancedb_uri,
-            embedding,
-            http_client: Client::new(),
+            embedder,
             lock: RwLock::new(()),
             message_store,
         }
@@ -115,10 +101,10 @@ impl SessionsStore {
                 "chat_id cannot be empty".to_string(),
             ));
         }
-        if req.centroid_vector.len() != self.embedding.dimension {
+        if req.centroid_vector.len() != self.embedder.dimension() {
             return Err(VfsError::InvalidRequest(format!(
                 "centroid_vector dimension mismatch: expected {}, got {}",
-                self.embedding.dimension,
+                self.embedder.dimension(),
                 req.centroid_vector.len()
             )));
         }
@@ -215,12 +201,11 @@ impl SessionsStore {
             return Err(VfsError::InvalidRequest("query cannot be empty".to_string()));
         }
 
-        // Embed query OUTSIDE the lock -- this is the slow network call
-        let query_vec = self.embed_query(&req.query).await?;
-        if query_vec.len() != self.embedding.dimension {
+        let query_vec = self.embedder.embed(&req.query).await?;
+        if query_vec.len() != self.embedder.dimension() {
             return Err(VfsError::InvalidRequest(format!(
                 "query embedding dimension mismatch: expected {}, got {}",
-                self.embedding.dimension,
+                self.embedder.dimension(),
                 query_vec.len()
             )));
         }
@@ -378,42 +363,8 @@ impl SessionsStore {
         Ok(stored.into_iter().map(pb_message_from_stored).collect())
     }
 
-    async fn embed_query(&self, query: &str) -> Result<Vec<f32>, VfsError> {
-        let base_url = self.embedding.base_url.trim_end_matches('/');
-        let input = if query.trim().is_empty() {
-            "(empty)"
-        } else {
-            query.trim()
-        };
-        let response = self
-            .http_client
-            .post(format!("{base_url}/api/embeddings"))
-            .json(&serde_json::json!({
-                "model": self.embedding.model,
-                "prompt": input
-            }))
-            .send()
-            .await
-            .map_err(|e| VfsError::Http(format!("ollama request failed: {e}")))?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "failed to read response body".to_string());
-            return Err(VfsError::Http(format!(
-                "ollama embed failed ({status}): {body}"
-            )));
-        }
-
-        let payload: OllamaEmbedResponse = response
-            .json()
-            .await
-            .map_err(|e| VfsError::Http(format!("invalid ollama response: {e}")))?;
-        payload.embedding.ok_or_else(|| {
-            VfsError::Http("invalid ollama response: embedding field missing".to_string())
-        })
+    pub fn embedding_dimension(&self) -> usize {
+        self.embedder.dimension()
     }
 
     async fn open_or_create_sessions_table(&self) -> Result<lancedb::Table, VfsError> {
@@ -504,7 +455,7 @@ impl SessionsStore {
         let schema = self.sessions_schema()?;
         let vectors = FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
             std::iter::empty::<Option<Vec<Option<f32>>>>(),
-            self.embedding.dimension as i32,
+            self.embedder.dimension() as i32,
         );
         RecordBatch::try_new(
             schema,
@@ -548,7 +499,7 @@ impl SessionsStore {
                     .map(Some)
                     .collect::<Vec<Option<f32>>>(),
             )),
-            self.embedding.dimension as i32,
+            self.embedder.dimension() as i32,
         );
         RecordBatch::try_new(
             schema,
@@ -595,7 +546,7 @@ impl SessionsStore {
     }
 
     fn sessions_schema(&self) -> Result<Arc<Schema>, VfsError> {
-        let dim = i32::try_from(self.embedding.dimension)
+        let dim = i32::try_from(self.embedder.dimension())
             .map_err(|e| VfsError::InvalidRequest(format!("invalid embedding dimension: {e}")))?;
         Ok(Arc::new(Schema::new(vec![
             Field::new("session_id", DataType::Utf8, false),
