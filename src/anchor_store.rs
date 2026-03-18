@@ -212,13 +212,23 @@ fn row_to_anchor(row: &rusqlite::Row<'_>) -> rusqlite::Result<Anchor> {
     })
 }
 
+// RFC 003 Section 6: anchor_id is a timestamp (e.g. "2026-03-12T14:32")
+// We include seconds for sub-minute uniqueness within the same task.
 fn generate_anchor_id() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
-    let nanos = SystemTime::now()
+    let dur = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    format!("anc-{nanos:x}")
+        .unwrap_or_default();
+    let secs = dur.as_secs();
+
+    let days = (secs / 86400) as u32;
+    let day_secs = (secs % 86400) as u32;
+    let hours = day_secs / 3600;
+    let minutes = (day_secs % 3600) / 60;
+    let seconds = day_secs % 60;
+
+    let (year, month, day) = crate::message_store::civil_from_days_u(days as i64);
+    format!("{year:04}-{month:02}-{day:02}T{hours:02}:{minutes:02}:{seconds:02}")
 }
 
 #[cfg(test)]
@@ -238,7 +248,10 @@ mod tests {
             .create_anchor("task-1", "completed auth", "[\"fact1\", \"fact2\"]")
             .await
             .unwrap();
-        assert!(!anchor_id.is_empty());
+
+        // RFC 003 S6: anchor_id is timestamp format YYYY-MM-DDTHH:MM:SS
+        assert!(anchor_id.contains('T'), "anchor_id should be timestamp format, got: {anchor_id}");
+        assert_eq!(anchor_id.len(), 19); // "2026-03-18T12:34:56"
 
         let anchor = store.get_anchor("task-1", &anchor_id).await.unwrap().unwrap();
         assert_eq!(anchor.summary, "completed auth");
@@ -250,6 +263,7 @@ mod tests {
         let store = make_test_store(tmp.path());
 
         store.create_anchor("task-1", "s1", "facts1").await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         store.create_anchor("task-1", "s2", "facts2").await.unwrap();
         store.create_anchor("task-2", "s3", "facts3").await.unwrap();
 
