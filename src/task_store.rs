@@ -31,14 +31,13 @@ pub struct NewTask {
     pub trigger: String,
 }
 
+// RFC 002 Section 4.3: pending → active → finished, active ↔ sleep
+// There is no 'cancelled' state — task abandonment is implicit in logos_complete({ resume })
 const VALID_TRANSITIONS: &[(&str, &str)] = &[
     ("pending", "active"),
     ("active", "finished"),
     ("active", "sleep"),
     ("sleep", "active"),
-    ("active", "cancelled"),
-    ("pending", "cancelled"),
-    ("sleep", "cancelled"),
 ];
 
 impl TaskStore {
@@ -238,7 +237,7 @@ fn init_task_schema(conn: &Connection) -> Result<(), VfsError> {
            resource     TEXT NOT NULL DEFAULT '',
            status       TEXT NOT NULL DEFAULT 'pending',
            chat_id      TEXT NOT NULL,
-           trigger      TEXT NOT NULL DEFAULT 'user',
+           trigger      TEXT NOT NULL DEFAULT 'user_message',
            created_at   TEXT NOT NULL,
            updated_at   TEXT NOT NULL
          );
@@ -283,7 +282,7 @@ mod tests {
             workspace: "ws-1".to_string(),
             resource: "".to_string(),
             chat_id: "chat-1".to_string(),
-            trigger: "user".to_string(),
+            trigger: "user_message".to_string(),
         }
     }
 
@@ -372,20 +371,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancel_from_any_active_state() {
+    async fn cancelled_state_does_not_exist() {
         let tmp = tempfile::tempdir().unwrap();
         let store = make_test_store(tmp.path());
 
         store.create_task(&sample_task("t1")).await.unwrap();
-        store.update_status("t1", "cancelled").await.unwrap();
-        let t = store.get_task("t1").await.unwrap().unwrap();
-        assert_eq!(t.status, "cancelled");
+        assert!(store.update_status("t1", "cancelled").await.is_err());
 
-        store.create_task(&sample_task("t2")).await.unwrap();
-        store.update_status("t2", "active").await.unwrap();
-        store.update_status("t2", "sleep").await.unwrap();
-        store.update_status("t2", "cancelled").await.unwrap();
-        let t = store.get_task("t2").await.unwrap().unwrap();
-        assert_eq!(t.status, "cancelled");
+        store.update_status("t1", "active").await.unwrap();
+        assert!(store.update_status("t1", "cancelled").await.is_err());
+
+        store.update_status("t1", "sleep").await.unwrap();
+        assert!(store.update_status("t1", "cancelled").await.is_err());
     }
 }
