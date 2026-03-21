@@ -1,0 +1,81 @@
+syntax = "proto3";
+
+package logos.kernel.v1;
+
+// The Logos kernel interface.
+//
+// Agent primitives: Read, Write, Patch, Exec, Call.
+// Turn terminator:  Complete.
+//
+// All data access goes through Read/Write/Patch with a logos:// URI.
+// Exec and Call are reserved for sandbox and proc namespaces (not yet implemented).
+// Complete is the mandatory final call of every agent turn.
+
+service Logos {
+  // Agent primitives
+  rpc Read(ReadReq) returns (ReadRes);
+  rpc Write(WriteReq) returns (WriteRes);
+  rpc Patch(PatchReq) returns (PatchRes);
+  rpc Exec(ExecReq) returns (ExecRes);
+  rpc Call(CallReq) returns (CallRes);
+  rpc Complete(CompleteReq) returns (CompleteRes);
+
+  // Kernel management interface (runtime-facing, not agent-facing)
+  rpc Handshake(HandshakeReq) returns (HandshakeRes);
+  rpc RegisterToken(RegisterTokenReq) returns (RegisterTokenRes);
+  rpc RevokeToken(RevokeTokenReq) returns (RevokeTokenRes);
+}
+
+// --- Read / Write / Patch: URI-routed data operations ---
+
+message ReadReq { string uri = 1; }
+message ReadRes { string content = 1; }
+
+message WriteReq { string uri = 1; string content = 2; }
+message WriteRes {}
+
+message PatchReq { string uri = 1; string partial = 2; }
+message PatchRes {}
+
+// --- Exec: sandbox shell execution (not yet implemented) ---
+
+message ExecReq { string command = 1; }
+message ExecRes {
+  string stdout = 1;
+  string stderr = 2;
+  int32 exit_code = 3;
+}
+
+// --- Call: proc tool invocation (not yet implemented) ---
+
+message CallReq { string tool = 1; string params_json = 2; }
+message CallRes { string result_json = 1; }
+
+// --- Complete: turn terminator and transaction boundary ---
+
+message CompleteReq {
+  string summary = 1;          // required: what happened this turn
+  string reply = 2;            // optional: message to deliver to the user
+  bool anchor = 3;             // optional: create a task completion anchor?
+  string task_log = 4;         // optional: execution details to append to log
+  string sleep_reason = 5;     // optional: "recoverable_error" | "awaiting_user"
+  bool sleep_retry = 6;        // optional: hint to adapter — auto-retry?
+  string resume_task_id = 7;   // optional: abandon current task, resume this one
+  string anchor_facts = 8;     // optional: JSON array of fact objects for the anchor
+}
+
+message CompleteRes {
+  string reply = 1;            // echo back for adapter delivery
+  string anchor_id = 2;        // created anchor ID, empty if anchor was false
+}
+
+// --- Kernel management: token-based task binding ---
+
+message HandshakeReq { string token = 1; }
+message HandshakeRes { bool ok = 1; string error = 2; }
+
+message RegisterTokenReq { string token = 1; string task_id = 2; }
+message RegisterTokenRes {}
+
+message RevokeTokenReq { string token = 1; }
+message RevokeTokenRes {}
