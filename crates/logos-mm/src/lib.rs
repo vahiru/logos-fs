@@ -69,6 +69,28 @@ impl Namespace for MemoryModule {
                         let limit: i64 = path.get(5).and_then(|s| s.parse().ok()).unwrap_or(10);
                         return self.messages.search_fts(gid, query, limit).await;
                     }
+                    if *sub == "range" {
+                        // logos://memory/groups/{gid}/messages/range/{ranges}[/{limit}[/{offset}]]
+                        // ranges format: "89-142,201-234"
+                        let range_str = path.get(4).unwrap_or(&"");
+                        let limit: i64 = path.get(5).and_then(|s| s.parse().ok()).unwrap_or(50);
+                        let offset: i64 = path.get(6).and_then(|s| s.parse().ok()).unwrap_or(0);
+                        let ranges: Vec<Vec<i64>> = range_str
+                            .split(',')
+                            .filter_map(|r| {
+                                let parts: Vec<&str> = r.split('-').collect();
+                                if parts.len() == 2 {
+                                    Some(vec![parts[0].parse().ok()?, parts[1].parse().ok()?])
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect();
+                        let params = serde_json::json!({
+                            "ranges": ranges, "limit": limit, "offset": offset
+                        });
+                        return self.messages.range_fetch(gid, &params.to_string()).await;
+                    }
                     // Assume numeric msg_id
                     let msg_id: i64 = sub
                         .parse()

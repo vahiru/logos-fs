@@ -4,17 +4,41 @@ use tonic::{Request, Response, Status};
 
 use crate::pb::logos_server::Logos;
 use crate::pb::*;
+use crate::token::TokenRegistry;
 use logos_vfs::{RoutingTable, VfsError};
+
+/// The metadata key used to pass the session key after Handshake.
+/// Client sends this in every request after a successful handshake.
+const SESSION_KEY_HEADER: &str = "x-logos-session";
 
 pub struct LogosService {
     table: Arc<RoutingTable>,
     system: Arc<logos_system::SystemModule>,
+    tokens: Arc<TokenRegistry>,
 }
 
 impl LogosService {
-    pub fn new(table: Arc<RoutingTable>, system: Arc<logos_system::SystemModule>) -> Self {
-        Self { table, system }
+    pub fn new(
+        table: Arc<RoutingTable>,
+        system: Arc<logos_system::SystemModule>,
+        tokens: Arc<TokenRegistry>,
+    ) -> Self {
+        Self {
+            table,
+            system,
+            tokens,
+        }
     }
+}
+
+/// Extract task_id from request metadata via session key.
+async fn extract_task_id(tokens: &TokenRegistry, request: &Request<impl std::any::Any>) -> Option<String> {
+    let session_key = request
+        .metadata()
+        .get(SESSION_KEY_HEADER)?
+        .to_str()
+        .ok()?;
+    tokens.resolve(session_key).await
 }
 
 fn vfs_to_status(e: VfsError) -> Status {
@@ -68,12 +92,16 @@ impl Logos for LogosService {
         &self,
         request: Request<CompleteReq>,
     ) -> Result<Response<CompleteRes>, Status> {
+        let task_id = extract_task_id(&self.tokens, &request)
+            .await
+            .unwrap_or_default();
         let req = request.into_inner();
         let params = logos_system::complete::CompleteParams {
-            task_id: String::new(), // TODO: derive from connection-bound task
+            task_id,
             summary: req.summary,
             reply: req.reply,
             anchor: req.anchor,
+            anchor_facts: req.anchor_facts,
             task_log: req.task_log,
             sleep_reason: req.sleep_reason,
             sleep_retry: req.sleep_retry,
@@ -81,5 +109,45 @@ impl Logos for LogosService {
         };
         self.system.complete(params).await.map_err(vfs_to_status)?;
         Ok(Response::new(CompleteRes {}))
+    }
+
+    // --- Kernel management interface ---
+
+    async fn handshake(
+        &self,
+        request: Request<HandshakeReq>,
+    ) -> Result<Response<HandshakeRes>, Status> {
+        let token = request.into_inner().token;
+        match self.tokens.consume(&token).await {
+            Some((session_key, _task_id)) => {
+                let mut res = Response::new(HandshakeRes {
+                    ok: true,
+                    error: String::new(),
+                });
+                // Return session key in response metadata — client must send it back
+                // in subsequent requests as x-logos-session header.
+                res.metadata_mut().insert(
+                    SESSION_KEY_HEADER,
+                    session_key.parse().unwrap(),
+                );
+                Ok(res)
+            }
+            None => Ok(Response::new(HandshakeRes {
+                ok: false,
+                error: "invalid or already consumed token".to_string(),
+            })),
+        }
+    }
+
+    async fn register_token(
+        &self,
+        request: Request<RegisterTokenReq>,
+    ) -> Result<Response<RegisterTokenRes>, Status> {
+        let req = request.into_inner();
+        if req.token.is_empty() || req.task_id.is_empty() {
+            return Err(Status::invalid_argument("token and task_id required"));
+        }
+        self.tokens.register(req.token, req.task_id).await;
+        Ok(Response::new(RegisterTokenRes {}))
     }
 }

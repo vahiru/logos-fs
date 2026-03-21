@@ -11,6 +11,7 @@ pub struct CompleteParams {
     pub summary: String,
     pub reply: String,
     pub anchor: bool,
+    pub anchor_facts: String,
     pub task_log: String,
     pub sleep_reason: String,
     pub sleep_retry: bool,
@@ -59,7 +60,7 @@ pub async fn execute(
         if params.anchor && !params.task_id.is_empty() {
             // anchors share the same db connection
             let _anchor_conn = anchor_conn.lock().map_err(|e| VfsError::Sqlite(e.to_string()))?;
-            AnchorDb::create_sync(&conn, &params.task_id, &params.summary, "")?;
+            AnchorDb::create_sync(&conn, &params.task_id, &params.summary, &params.anchor_facts)?;
         }
 
         Ok(())

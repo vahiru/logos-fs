@@ -1,5 +1,6 @@
 mod grpc;
 mod tmp;
+mod token;
 mod users;
 
 use std::path::PathBuf;
@@ -58,7 +59,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // --- Serve ---
     let table = Arc::new(table);
-    let service = grpc::LogosService::new(Arc::clone(&table), system_arc);
+    let tokens = token::TokenRegistry::new();
+    let service = grpc::LogosService::new(Arc::clone(&table), system_arc, tokens);
     let grpc_service = pb::logos_server::LogosServer::new(service);
 
     let listen = env_str("VFS_LISTEN", "unix:///run/logos/logos.sock");

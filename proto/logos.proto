@@ -12,12 +12,17 @@ package logos.kernel.v1;
 // Complete is the mandatory final call of every agent turn.
 
 service Logos {
+  // Agent primitives
   rpc Read(ReadReq) returns (ReadRes);
   rpc Write(WriteReq) returns (WriteRes);
   rpc Patch(PatchReq) returns (PatchRes);
   rpc Exec(ExecReq) returns (ExecRes);
   rpc Call(CallReq) returns (CallRes);
   rpc Complete(CompleteReq) returns (CompleteRes);
+
+  // Kernel management interface (runtime-facing, not agent-facing)
+  rpc Handshake(HandshakeReq) returns (HandshakeRes);
+  rpc RegisterToken(RegisterTokenReq) returns (RegisterTokenRes);
 }
 
 // --- Read / Write / Patch: URI-routed data operations ---
@@ -55,6 +60,15 @@ message CompleteReq {
   string sleep_reason = 5;     // optional: "recoverable_error" | "awaiting_user"
   bool sleep_retry = 6;        // optional: hint to adapter — auto-retry?
   string resume_task_id = 7;   // optional: abandon current task, resume this one
+  string anchor_facts = 8;     // optional: JSON array of fact objects for the anchor
 }
 
 message CompleteRes {}
+
+// --- Kernel management: token-based task binding ---
+
+message HandshakeReq { string token = 1; }
+message HandshakeRes { bool ok = 1; string error = 2; }
+
+message RegisterTokenReq { string token = 1; string task_id = 2; }
+message RegisterTokenRes {}
