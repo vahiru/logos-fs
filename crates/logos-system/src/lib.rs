@@ -49,6 +49,11 @@ impl SystemModule {
         self.tasks.create(content).await
     }
 
+    /// Transition a task's status (used by runtime for task lifecycle).
+    pub async fn transition_task(&self, task_id: &str, new_status: &str) -> Result<(), VfsError> {
+        tasks::TaskDb::transition_status(&self.tasks.pool, task_id, new_status).await
+    }
+
     /// Search tasks and anchors — RFC 003 §6.2 multi-level experience retrieval.
     pub async fn search_tasks(&self, query: &str, limit: i64) -> Result<String, VfsError> {
         search::search_tasks(&self.tasks.pool, query, limit).await
