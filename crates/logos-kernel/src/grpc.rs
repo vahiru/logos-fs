@@ -6,15 +6,17 @@ use crate::pb::logos_server::Logos;
 use crate::pb::*;
 use crate::sandbox::SandboxNs;
 use crate::token::TokenRegistry;
-use logos_vfs::{RoutingTable, VfsError};
+use logos_vfs::{Namespace, RoutingTable, VfsError};
 
 const SESSION_KEY_HEADER: &str = "x-logos-session";
 
 pub struct LogosService {
     table: Arc<RoutingTable>,
     system: Arc<logos_system::SystemModule>,
+    #[allow(dead_code)]
     mm: Arc<logos_mm::MemoryModule>,
     sandbox: Arc<SandboxNs>,
+    proc_ns: Arc<crate::proc::ProcNs>,
     tokens: Arc<TokenRegistry>,
 }
 
@@ -24,6 +26,7 @@ impl LogosService {
         system: Arc<logos_system::SystemModule>,
         mm: Arc<logos_mm::MemoryModule>,
         sandbox: Arc<SandboxNs>,
+        proc_ns: Arc<crate::proc::ProcNs>,
         tokens: Arc<TokenRegistry>,
     ) -> Self {
         Self {
@@ -31,17 +34,57 @@ impl LogosService {
             system,
             mm,
             sandbox,
+            proc_ns,
             tokens,
         }
     }
 }
 
-async fn extract_task_id(
+use crate::token::{AgentRole, SessionInfo};
+
+async fn extract_session_info(
     tokens: &TokenRegistry,
     request: &Request<impl std::any::Any>,
-) -> Option<String> {
+) -> Option<SessionInfo> {
     let session_key = request.metadata().get(SESSION_KEY_HEADER)?.to_str().ok()?;
-    tokens.resolve(session_key).await
+    tokens.resolve_info(session_key).await
+}
+
+/// RFC 002 §12.3: enforce sandbox access + workspace exclusivity + namespace permissions.
+fn check_access(info: Option<&SessionInfo>, uri: &str, is_write: bool) -> Result<(), Status> {
+    // Sandbox isolation: task can only access its own sandbox
+    if let Some(si) = info {
+        if let Some(rest) = uri.strip_prefix("logos://sandbox/") {
+            let uri_task = rest.split('/').next().unwrap_or("");
+            if !uri_task.is_empty() && uri_task != "__system__" && uri_task != si.task_id {
+                return Err(Status::permission_denied(format!(
+                    "task {} cannot access sandbox of {uri_task}",
+                    si.task_id
+                )));
+            }
+        }
+    }
+
+    // Namespace permission enforcement (RFC 002 §12.3)
+    if is_write {
+        if let Some(si) = info {
+            if !si.role.is_admin() {
+                // User agents: services, system, devices are read-only
+                if uri.starts_with("logos://services/")
+                    || uri.starts_with("logos://system/")
+                    || uri.starts_with("logos://devices/")
+                {
+                    return Err(Status::permission_denied(format!(
+                        "user agent cannot write to {}",
+                        uri.split('/').take(4).collect::<Vec<_>>().join("/")
+                    )));
+                }
+            }
+        }
+        // No session header = management interface = admin (allowed)
+    }
+
+    Ok(())
 }
 
 fn vfs_to_status(e: VfsError) -> Status {
@@ -60,13 +103,17 @@ fn vfs_to_status(e: VfsError) -> Status {
 #[tonic::async_trait]
 impl Logos for LogosService {
     async fn read(&self, request: Request<ReadReq>) -> Result<Response<ReadRes>, Status> {
+        let info = extract_session_info(&self.tokens, &request).await;
         let uri = request.into_inner().uri;
+        check_access(info.as_ref(), &uri, false)?;
         let content = self.table.read(&uri).await.map_err(vfs_to_status)?;
         Ok(Response::new(ReadRes { content }))
     }
 
     async fn write(&self, request: Request<WriteReq>) -> Result<Response<WriteRes>, Status> {
+        let info = extract_session_info(&self.tokens, &request).await;
         let req = request.into_inner();
+        check_access(info.as_ref(), &req.uri, true)?;
         self.table
             .write(&req.uri, &req.content)
             .await
@@ -75,7 +122,9 @@ impl Logos for LogosService {
     }
 
     async fn patch(&self, request: Request<PatchReq>) -> Result<Response<PatchRes>, Status> {
+        let info = extract_session_info(&self.tokens, &request).await;
         let req = request.into_inner();
+        check_access(info.as_ref(), &req.uri, true)?;
         self.table
             .patch(&req.uri, &req.partial)
             .await
@@ -95,16 +144,9 @@ impl Logos for LogosService {
 
     async fn call(&self, request: Request<CallReq>) -> Result<Response<CallRes>, Status> {
         let req = request.into_inner();
-        let result_json = match req.tool.as_str() {
-            "memory.vsearch" => self.mm.vsearch(&req.params_json).await.map_err(vfs_to_status)?,
-            "system.search_tasks" => {
-                self.system
-                    .search_tasks(&req.params_json)
-                    .await
-                    .map_err(vfs_to_status)?
-            }
-            _ => return Err(Status::not_found(format!("unknown tool: {}", req.tool))),
-        };
+        let result_json = self.proc_ns.call(&req.tool, &req.params_json)
+            .await
+            .map_err(vfs_to_status)?;
         Ok(Response::new(CallRes { result_json }))
     }
 
@@ -112,10 +154,11 @@ impl Logos for LogosService {
         &self,
         request: Request<CompleteReq>,
     ) -> Result<Response<CompleteRes>, Status> {
-        let task_id = extract_task_id(&self.tokens, &request)
-            .await
-            .unwrap_or_default();
+        let info = extract_session_info(&self.tokens, &request).await;
+        let task_id = info.map(|i| i.task_id).unwrap_or_default();
         let req = request.into_inner();
+        let task_log = req.task_log.clone();
+        let tid = task_id.clone();
         let params = logos_system::complete::CompleteParams {
             task_id,
             summary: req.summary,
@@ -128,6 +171,15 @@ impl Logos for LogosService {
             resume_task_id: req.resume_task_id,
         };
         let result = self.system.complete(params).await.map_err(vfs_to_status)?;
+
+        // RFC 002 §9.1 step 3: write task_log to logos://sandbox/{task_id}/log
+        if !task_log.is_empty() && !tid.is_empty() {
+            self.sandbox
+                .patch(&[&tid, "log"], &task_log)
+                .await
+                .map_err(vfs_to_status)?;
+        }
+
         Ok(Response::new(CompleteRes {
             reply: result.reply,
             anchor_id: result.anchor_id,
@@ -166,7 +218,8 @@ impl Logos for LogosService {
         if req.token.is_empty() || req.task_id.is_empty() {
             return Err(Status::invalid_argument("token and task_id required"));
         }
-        self.tokens.register(req.token, req.task_id).await;
+        let role = AgentRole::from_str(&req.role);
+        self.tokens.register(req.token, req.task_id, role).await;
         Ok(Response::new(RegisterTokenRes {}))
     }
 
