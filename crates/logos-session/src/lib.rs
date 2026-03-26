@@ -406,7 +406,7 @@ async fn lance_load_by_msg(
     let table = conn.open_table(SESSIONS_TABLE).execute().await?;
     let results = table
         .query()
-        .only_if(format!("data LIKE '%\"msg_id\":{msg_id}%'"))
+        .only_if(format!("data LIKE '%\"msg_id\":{msg_id},%' OR data LIKE '%\"msg_id\":{msg_id}}}%'"))
         .execute()
         .await?;
 
