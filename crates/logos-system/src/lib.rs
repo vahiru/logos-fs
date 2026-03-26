@@ -44,6 +44,11 @@ impl SystemModule {
         Ok(Self { tasks, anchors })
     }
 
+    /// Get a single task by ID.
+    pub async fn get_task(&self, task_id: &str) -> Result<Option<String>, VfsError> {
+        self.tasks.get(task_id).await
+    }
+
     /// Create a task programmatically (used by cron scheduler).
     pub async fn create_task(&self, content: &str) -> Result<(), VfsError> {
         self.tasks.create(content).await

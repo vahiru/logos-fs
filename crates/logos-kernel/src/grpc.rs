@@ -51,16 +51,35 @@ async fn extract_session_info(
 }
 
 /// RFC 002 §12.3: enforce sandbox access + workspace exclusivity + namespace permissions.
-fn check_access(info: Option<&SessionInfo>, uri: &str, is_write: bool) -> Result<(), Status> {
-    // Sandbox isolation: task can only access its own sandbox
+async fn check_access(
+    info: Option<&SessionInfo>,
+    uri: &str,
+    is_write: bool,
+    system: &logos_system::SystemModule,
+) -> Result<(), Status> {
+    // Sandbox isolation: workspace exclusivity
     if let Some(si) = info {
         if let Some(rest) = uri.strip_prefix("logos://sandbox/") {
             let uri_task = rest.split('/').next().unwrap_or("");
             if !uri_task.is_empty() && uri_task != "__system__" && uri_task != si.task_id {
-                return Err(Status::permission_denied(format!(
-                    "task {} cannot access sandbox of {uri_task}",
-                    si.task_id
-                )));
+                // Not our task — check if it's finished (non-owner can read finished tasks)
+                if is_write {
+                    return Err(Status::permission_denied(format!(
+                        "task {} cannot write to sandbox of {uri_task}",
+                        si.task_id
+                    )));
+                }
+                // Read access: only if target task is finished
+                if let Ok(Some(task_json)) = system.get_task(uri_task).await {
+                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(&task_json) {
+                        if val["status"].as_str() != Some("finished") {
+                            return Err(Status::permission_denied(format!(
+                                "task {} cannot read active sandbox of {uri_task}",
+                                si.task_id
+                            )));
+                        }
+                    }
+                }
             }
         }
     }
@@ -105,7 +124,7 @@ impl Logos for LogosService {
     async fn read(&self, request: Request<ReadReq>) -> Result<Response<ReadRes>, Status> {
         let info = extract_session_info(&self.tokens, &request).await;
         let uri = request.into_inner().uri;
-        check_access(info.as_ref(), &uri, false)?;
+        check_access(info.as_ref(), &uri, false, &self.system).await?;
         let content = self.table.read(&uri).await.map_err(vfs_to_status)?;
         Ok(Response::new(ReadRes { content }))
     }
@@ -113,7 +132,7 @@ impl Logos for LogosService {
     async fn write(&self, request: Request<WriteReq>) -> Result<Response<WriteRes>, Status> {
         let info = extract_session_info(&self.tokens, &request).await;
         let req = request.into_inner();
-        check_access(info.as_ref(), &req.uri, true)?;
+        check_access(info.as_ref(), &req.uri, true, &self.system).await?;
         self.table
             .write(&req.uri, &req.content)
             .await
@@ -124,7 +143,7 @@ impl Logos for LogosService {
     async fn patch(&self, request: Request<PatchReq>) -> Result<Response<PatchRes>, Status> {
         let info = extract_session_info(&self.tokens, &request).await;
         let req = request.into_inner();
-        check_access(info.as_ref(), &req.uri, true)?;
+        check_access(info.as_ref(), &req.uri, true, &self.system).await?;
         self.table
             .patch(&req.uri, &req.partial)
             .await
