@@ -257,3 +257,119 @@ impl Logos for LogosService {
         Ok(Response::new(RevokeTokenRes {}))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::token::{AgentRole, SessionInfo};
+
+    async fn test_system() -> (logos_system::SystemModule, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let sys = logos_system::SystemModule::init(dir.path().join("test.db"))
+            .await
+            .unwrap();
+        (sys, dir)
+    }
+
+    fn make_session(task_id: &str, agent_id: &str, role: AgentRole) -> SessionInfo {
+        SessionInfo {
+            task_id: task_id.to_string(),
+            agent_id: agent_id.to_string(),
+            role,
+        }
+    }
+
+    // --- Namespace permission tests ---
+
+    #[tokio::test]
+    async fn user_cannot_write_services() {
+        let (sys, _dir) = test_system().await;
+        let si = make_session("t-1", "a-1", AgentRole::User);
+        let result = check_access(Some(&si), "logos://services/tts", true, &sys).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn user_cannot_write_system() {
+        let (sys, _dir) = test_system().await;
+        let si = make_session("t-1", "a-1", AgentRole::User);
+        let result = check_access(Some(&si), "logos://system/tasks", true, &sys).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn admin_can_write_services() {
+        let (sys, _dir) = test_system().await;
+        let si = make_session("t-1", "a-1", AgentRole::Admin);
+        let result = check_access(Some(&si), "logos://services/tts", true, &sys).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn user_can_read_services() {
+        let (sys, _dir) = test_system().await;
+        let si = make_session("t-1", "a-1", AgentRole::User);
+        let result = check_access(Some(&si), "logos://services/tts", false, &sys).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn no_session_is_admin() {
+        let (sys, _dir) = test_system().await;
+        let result = check_access(None, "logos://system/tasks", true, &sys).await;
+        assert!(result.is_ok());
+    }
+
+    // --- Sandbox ownership tests ---
+
+    #[tokio::test]
+    async fn owner_can_access_own_sandbox() {
+        let (sys, _dir) = test_system().await;
+        let si = make_session("t-1", "a-1", AgentRole::User);
+        let result = check_access(Some(&si), "logos://sandbox/t-1/repo", true, &sys).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn non_owner_cannot_write_other_sandbox() {
+        let (sys, _dir) = test_system().await;
+        let si = make_session("t-1", "a-1", AgentRole::User);
+        let result = check_access(Some(&si), "logos://sandbox/t-2/repo", true, &sys).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn non_owner_cannot_read_active_sandbox() {
+        let (sys, _dir) = test_system().await;
+        // Create task t-2 and make it active
+        sys.create_task(r#"{"task_id":"t-2","description":"other task","chat_id":"c-1"}"#)
+            .await.unwrap();
+        sys.transition_task("t-2", "active").await.unwrap();
+
+        let si = make_session("t-1", "a-1", AgentRole::User);
+        let result = check_access(Some(&si), "logos://sandbox/t-2/repo", false, &sys).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn non_owner_can_read_finished_sandbox() {
+        let (sys, _dir) = test_system().await;
+        // Create task t-2 and finish it
+        sys.create_task(r#"{"task_id":"t-2","description":"done task","chat_id":"c-1"}"#)
+            .await.unwrap();
+        sys.transition_task("t-2", "active").await.unwrap();
+        sys.transition_task("t-2", "finished").await.unwrap();
+
+        let si = make_session("t-1", "a-1", AgentRole::User);
+        let result = check_access(Some(&si), "logos://sandbox/t-2/repo", false, &sys).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn system_sandbox_always_accessible() {
+        let (sys, _dir) = test_system().await;
+        let si = make_session("t-1", "a-1", AgentRole::User);
+        let result = check_access(Some(&si), "logos://sandbox/__system__/proc/tool", false, &sys).await;
+        assert!(result.is_ok());
+    }
+}
