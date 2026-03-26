@@ -33,11 +33,7 @@ pub async fn execute(
     // Resume: discard current task, activate target
     if !params.resume_task_id.is_empty() {
         if !params.task_id.is_empty() {
-            sqlx::query("DELETE FROM tasks WHERE task_id = ?1")
-                .bind(&params.task_id)
-                .execute(&tasks.pool)
-                .await
-                .map_err(|e| VfsError::Sqlite(format!("discard task: {e}")))?;
+            TaskDb::delete(&tasks.pool, &params.task_id).await?;
         }
         TaskDb::transition_status(&tasks.pool, &params.resume_task_id, "active").await?;
         return Ok(CompleteResult {

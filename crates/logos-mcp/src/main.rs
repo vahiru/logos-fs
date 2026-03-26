@@ -348,6 +348,51 @@ async fn call_tool(
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tool_definitions_has_five_tools() {
+        let defs = tool_definitions();
+        let tools = defs["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 5);
+        let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert!(names.contains(&"logos_read"));
+        assert!(names.contains(&"logos_write"));
+        assert!(names.contains(&"logos_exec"));
+        assert!(names.contains(&"logos_call"));
+        assert!(names.contains(&"logos_complete"));
+    }
+
+    #[test]
+    fn tool_schemas_have_required_fields() {
+        let defs = tool_definitions();
+        let tools = defs["tools"].as_array().unwrap();
+        for tool in tools {
+            assert!(tool["name"].is_string());
+            assert!(tool["description"].is_string());
+            assert!(tool["inputSchema"].is_object());
+            assert!(tool["inputSchema"]["required"].is_array());
+        }
+    }
+
+    #[test]
+    fn parse_valid_jsonrpc_request() {
+        let input = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#;
+        let req: JsonRpcRequest = serde_json::from_str(input).unwrap();
+        assert_eq!(req.method, "tools/list");
+        assert_eq!(req.id, serde_json::json!(1));
+    }
+
+    #[test]
+    fn parse_invalid_jsonrpc_fails() {
+        let input = "not json{{{";
+        let result: Result<JsonRpcRequest, _> = serde_json::from_str(input);
+        assert!(result.is_err());
+    }
+}
+
 /// Connect to a Unix Domain Socket gRPC endpoint.
 async fn connect_uds(path: &str) -> Result<Channel, Box<dyn std::error::Error>> {
     let path = path.to_string();

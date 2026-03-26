@@ -86,6 +86,16 @@ impl TaskDb {
         Ok(())
     }
 
+    /// Delete a task by ID (used by resume to discard the current empty task).
+    pub async fn delete(pool: &SqlitePool, task_id: &str) -> Result<(), VfsError> {
+        sqlx::query("DELETE FROM tasks WHERE task_id = ?1")
+            .bind(task_id)
+            .execute(pool)
+            .await
+            .map_err(|e| VfsError::Sqlite(format!("delete task: {e}")))?;
+        Ok(())
+    }
+
     pub async fn update_description(
         &self,
         task_id: &str,

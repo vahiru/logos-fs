@@ -75,7 +75,7 @@ message CompleteRes {
 message HandshakeReq { string token = 1; }
 message HandshakeRes { bool ok = 1; string error = 2; }
 
-message RegisterTokenReq { string token = 1; string task_id = 2; string role = 3; }
+message RegisterTokenReq { string token = 1; string task_id = 2; string role = 3; string agent_id = 4; }
 message RegisterTokenRes {}
 
 message RevokeTokenReq { string token = 1; }

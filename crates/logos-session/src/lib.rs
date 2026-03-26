@@ -197,52 +197,94 @@ impl SessionStore {
 
     /// Observe a new message and update session topology.
     pub async fn observe(&self, msg: MsgRef) {
-        let mut inner = self.inner.lock().await;
         let msg_id = msg.msg_id;
+        let reply_to = msg.reply_to;
 
-        if let Some(reply_to) = msg.reply_to {
-            if let Some(sid) = inner.msg_index.get(&reply_to).cloned() {
-                let needs_promote = match inner.find_session_mut(&sid) {
-                    Some((session, layer)) => {
-                        session.add_message(msg);
-                        layer > 0
-                    }
-                    None => false,
-                };
-                if needs_promote {
-                    inner.promote_to_l0(&sid);
+        // Page fault: load from L2 outside the lock
+        let page_fault_session = if let Some(reply_to) = reply_to {
+            let need_fault = {
+                let inner = self.inner.lock().await;
+                inner.msg_index.get(&reply_to).is_none()
+            };
+            if need_fault {
+                if let Some(ref lance) = self.lance {
+                    lance_load_by_msg(lance, reply_to).await.ok().flatten()
+                } else {
+                    None
                 }
-                inner.msg_index.insert(msg_id, sid);
-                self.evict_if_needed(&mut inner).await;
-                return;
+            } else {
+                None
             }
+        } else {
+            None
+        };
 
-            // Page fault: check L2 (LanceDB)
+        // Delete from L2 outside the lock (if we loaded a session)
+        let fault_sid = page_fault_session.as_ref().map(|s| s.session_id.clone());
+        if let Some(ref sid) = fault_sid {
             if let Some(ref lance) = self.lance {
-                if let Ok(Some(mut session)) = lance_load_by_msg(lance, reply_to).await {
-                    for m in &session.messages {
-                        inner.msg_index.insert(m.msg_id, session.session_id.clone());
-                    }
-                    session.add_message(msg);
-                    inner.msg_index.insert(msg_id, session.session_id.clone());
-                    let sid = session.session_id.clone();
-                    let _ = lance_delete(lance, &sid).await;
-                    inner.l0.insert(sid, session);
-                    self.evict_if_needed(&mut inner).await;
-                    return;
-                }
+                let _ = lance_delete(lance, sid).await;
             }
         }
 
-        let chat_id = msg.chat_id.clone();
-        let session = Session::new(&chat_id, msg);
-        let sid = session.session_id.clone();
-        inner.msg_index.insert(msg_id, sid.clone());
-        inner.l0.insert(sid, session);
-        self.evict_if_needed(&mut inner).await;
+        // Now take the lock for in-memory operations only
+        let evicted = {
+            let mut inner = self.inner.lock().await;
+
+            // Insert page-faulted session into L0
+            if let Some(mut session) = page_fault_session {
+                for m in &session.messages {
+                    inner.msg_index.insert(m.msg_id, session.session_id.clone());
+                }
+                session.add_message(msg.clone());
+                inner.msg_index.insert(msg_id, session.session_id.clone());
+                let sid = session.session_id.clone();
+                inner.l0.insert(sid, session);
+                Self::evict_collect(&mut inner)
+            } else if let Some(reply_to) = reply_to {
+                if let Some(sid) = inner.msg_index.get(&reply_to).cloned() {
+                    let needs_promote = match inner.find_session_mut(&sid) {
+                        Some((session, layer)) => {
+                            session.add_message(msg);
+                            layer > 0
+                        }
+                        None => false,
+                    };
+                    if needs_promote {
+                        inner.promote_to_l0(&sid);
+                    }
+                    inner.msg_index.insert(msg_id, sid);
+                    Self::evict_collect(&mut inner)
+                } else {
+                    // reply_to not found anywhere — create new session
+                    let chat_id = msg.chat_id.clone();
+                    let session = Session::new(&chat_id, msg);
+                    let sid = session.session_id.clone();
+                    inner.msg_index.insert(msg_id, sid.clone());
+                    inner.l0.insert(sid, session);
+                    Self::evict_collect(&mut inner)
+                }
+            } else {
+                let chat_id = msg.chat_id.clone();
+                let session = Session::new(&chat_id, msg);
+                let sid = session.session_id.clone();
+                inner.msg_index.insert(msg_id, sid.clone());
+                inner.l0.insert(sid, session);
+                Self::evict_collect(&mut inner)
+            }
+        }; // lock released here
+
+        // Persist evicted sessions outside the lock
+        if let Some(ref lance) = self.lance {
+            for session in evicted {
+                let _ = lance_persist(lance, &session).await;
+            }
+        }
     }
 
-    async fn evict_if_needed(&self, inner: &mut Inner) {
+    /// Collect sessions to evict from L1 (returns them for IO outside the lock).
+    fn evict_collect(inner: &mut Inner) -> Vec<Session> {
+        // L0 → L1 demotion (no IO needed)
         while inner.l0.len() > inner.l0_capacity {
             let oldest = inner
                 .l0
@@ -257,6 +299,8 @@ impl SessionStore {
                 break;
             }
         }
+        // L1 → L2 demotion (collect for IO outside lock)
+        let mut evicted = Vec::new();
         while inner.l1.len() > inner.l1_capacity {
             let oldest = inner
                 .l1
@@ -265,15 +309,14 @@ impl SessionStore {
                 .map(|(k, _)| k.clone());
             if let Some(key) = oldest {
                 if let Some(s) = inner.l1.remove(&key) {
-                    if let Some(ref lance) = self.lance {
-                        let _ = lance_persist(lance, &s).await;
-                    }
                     inner.msg_index.retain(|_, v| *v != key);
+                    evicted.push(s);
                 }
             } else {
                 break;
             }
         }
+        evicted
     }
 
     pub async fn get_session_for_msg(&self, msg_id: i64) -> Option<Session> {
@@ -406,7 +449,7 @@ async fn lance_load_by_msg(
     let table = conn.open_table(SESSIONS_TABLE).execute().await?;
     let results = table
         .query()
-        .only_if(format!("data LIKE '%\"msg_id\":{msg_id}%'"))
+        .only_if(format!("data LIKE '%\"msg_id\":{msg_id},%' OR data LIKE '%\"msg_id\":{msg_id}}}%'"))
         .execute()
         .await?;
 
