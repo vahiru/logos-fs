@@ -31,6 +31,7 @@ impl AgentRole {
 #[derive(Debug, Clone)]
 pub struct SessionInfo {
     pub task_id: String,
+    pub agent_id: String,
     pub role: AgentRole,
 }
 
@@ -50,11 +51,13 @@ pub struct TokenRegistry {
 
 struct PendingEntry {
     task_id: String,
+    agent_id: String,
     role: AgentRole,
 }
 
 struct SessionEntry {
     task_id: String,
+    agent_id: String,
     role: AgentRole,
     created_at: Instant,
 }
@@ -79,11 +82,11 @@ impl TokenRegistry {
         registry
     }
 
-    pub async fn register(&self, token: String, task_id: String, role: AgentRole) {
+    pub async fn register(&self, token: String, task_id: String, agent_id: String, role: AgentRole) {
         self.pending
             .write()
             .await
-            .insert(token, PendingEntry { task_id, role });
+            .insert(token, PendingEntry { task_id, agent_id, role });
     }
 
     pub async fn revoke(&self, token: &str) {
@@ -101,6 +104,7 @@ impl TokenRegistry {
             session_key.clone(),
             SessionEntry {
                 task_id: entry.task_id.clone(),
+                agent_id: entry.agent_id.clone(),
                 role: entry.role,
                 created_at: Instant::now(),
             },
@@ -121,6 +125,7 @@ impl TokenRegistry {
     pub async fn resolve_info(&self, session_key: &str) -> Option<SessionInfo> {
         self.sessions.read().await.get(session_key).map(|e| SessionInfo {
             task_id: e.task_id.clone(),
+            agent_id: e.agent_id.clone(),
             role: e.role.clone(),
         })
     }
@@ -141,7 +146,7 @@ mod tests {
     #[tokio::test]
     async fn register_and_consume() {
         let reg = TokenRegistry::new();
-        reg.register("tok-1".to_string(), "task-001".to_string(), AgentRole::User)
+        reg.register("tok-1".to_string(), "task-001".to_string(), String::new(), AgentRole::User)
             .await;
         let (key, task_id) = reg.consume("tok-1").await.unwrap();
         assert_eq!(task_id, "task-001");
@@ -151,7 +156,7 @@ mod tests {
     #[tokio::test]
     async fn consume_is_one_time() {
         let reg = TokenRegistry::new();
-        reg.register("tok-2".to_string(), "task-002".to_string(), AgentRole::User)
+        reg.register("tok-2".to_string(), "task-002".to_string(), String::new(), AgentRole::User)
             .await;
         assert!(reg.consume("tok-2").await.is_some());
         assert!(reg.consume("tok-2").await.is_none());
@@ -166,7 +171,7 @@ mod tests {
     #[tokio::test]
     async fn resolve_after_handshake() {
         let reg = TokenRegistry::new();
-        reg.register("tok-3".to_string(), "task-003".to_string(), AgentRole::Admin)
+        reg.register("tok-3".to_string(), "task-003".to_string(), "agent-A".to_string(), AgentRole::Admin)
             .await;
         let (key, _) = reg.consume("tok-3").await.unwrap();
         let info = reg.resolve_info(&key).await.unwrap();
@@ -177,7 +182,7 @@ mod tests {
     #[tokio::test]
     async fn revoke_pending_token() {
         let reg = TokenRegistry::new();
-        reg.register("tok-4".to_string(), "task-004".to_string(), AgentRole::User)
+        reg.register("tok-4".to_string(), "task-004".to_string(), String::new(), AgentRole::User)
             .await;
         reg.revoke("tok-4").await;
         assert!(reg.consume("tok-4").await.is_none());
@@ -186,7 +191,7 @@ mod tests {
     #[tokio::test]
     async fn user_role_default() {
         let reg = TokenRegistry::new();
-        reg.register("tok-5".to_string(), "task-005".to_string(), AgentRole::User)
+        reg.register("tok-5".to_string(), "task-005".to_string(), String::new(), AgentRole::User)
             .await;
         let (key, _) = reg.consume("tok-5").await.unwrap();
         let info = reg.resolve_info(&key).await.unwrap();

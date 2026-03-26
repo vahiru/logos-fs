@@ -219,7 +219,7 @@ impl Logos for LogosService {
             return Err(Status::invalid_argument("token and task_id required"));
         }
         let role = AgentRole::from_str(&req.role);
-        self.tokens.register(req.token, req.task_id, role).await;
+        self.tokens.register(req.token, req.task_id, req.agent_id, role).await;
         Ok(Response::new(RegisterTokenRes {}))
     }
 
