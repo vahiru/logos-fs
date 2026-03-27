@@ -53,9 +53,15 @@ Management interface (called by runtime, not agents):
 | `groups/{gid}/messages/{id}` | Single message JSON | — | — |
 | `groups/{gid}/summary/{layer}/latest` | Latest summary | — | — |
 | `groups/{gid}/summary/{layer}/{period}` | Summary for period | Write/overwrite | **deep merge** |
+| `groups/{gid}/graph/` | List all entities | — | — |
+| `groups/{gid}/graph/{entity_id}` | Entity details + relations | Write/upsert entity + relations | Upsert |
+| `groups/{gid}/graph/{entity_id}/relations` | Just relations | — | — |
 | `groups/{gid}/views/{name}` | Query view | — | — |
+| `plugins/` | List mounted view plugins (name + docs) | — | — |
 
 > layer = short (hourly) / mid (daily) / long (monthly); period = ISO8601 (`2026-03-20T10` / `2026-03-20` / `2026-03`)
+>
+> Memory views are pluggable modules (RFC 003 §11). `summary/` and `graph/` are the default plugins. Discover via `logos://memory/plugins/`.
 
 ### 3.2 system
 
@@ -159,9 +165,9 @@ Management interface (called by runtime, not agents):
 | Subsystem | Storage | Purpose |
 |-----------|---------|---------|
 | **Token Registry** | In-memory (24h TTL) | One-time token → session binding; role = User / Admin; carries agent_config_id |
-| **Session Clustering** | In-memory L0/L1 + LanceDB L2 | Reply-chain-based session clustering, 3-layer LRU eviction |
+| **Session Clustering** | In-memory L0/L1 + SQLite L2 | Reply-chain-based session clustering, 3-layer LRU eviction |
 | **Cron Scheduler** | In-memory job table | 60s tick, cron expression matching → create pending task |
-| **Consolidator** | 4 registered cron jobs | Progressive memory compression: messages → hourly → daily summaries; persona likewise |
+| **Consolidator** | 5 registered cron jobs | Progressive memory compression: messages → hourly → daily summaries; persona; knowledge graph |
 | **Context Injector** | Stateless | Assemble session + summary + persona before agent turn |
 | **VFS Middleware** | — | JsonValidator: validate JSON before writes to system/ and memory/ |
 
@@ -173,6 +179,7 @@ Management interface (called by runtime, not agents):
 | `consolidate-short-persona` | Hourly :05 | Raw messages → persona observations |
 | `consolidate-mid-summary` | Daily 03:00 | Short summaries → mid summary |
 | `consolidate-mid-persona` | Daily 03:30 | Short persona → rewrite mid persona |
+| `consolidate-graph` | Hourly :10 | Extract entities + relations → knowledge graph |
 
 ### Session Clustering: 3-Layer LRU
 
@@ -180,7 +187,7 @@ Management interface (called by runtime, not agents):
 |-------|---------|---------|
 | L0 | In-memory HashMap | Active sessions (recently replied to) |
 | L1 | In-memory HashMap | Inactive (LRU-evicted from L0) |
-| L2 | LanceDB | Archived (persisted on L1 eviction, page-faulted back to L0 on reply) |
+| L2 | SQLite | Archived (persisted on L1 eviction, page-faulted back to L0 on reply) |
 
 > Core principle: reply chains are hard bindings; semantic similarity is only a fallback.
 
@@ -224,6 +231,6 @@ logos-fs/
 │   ├── logos-kernel/          # Kernel: gRPC impl, namespace mounting, Token, Cron, Consolidator, Context
 │   ├── logos-mm/              # Memory module: message storage, summaries, views, FTS5
 │   ├── logos-system/          # System module: task state machine, anchors, search
-│   ├── logos-session/         # Session clustering: reply-chain topology, 3-layer LRU, LanceDB L2
+│   ├── logos-session/         # Session clustering: reply-chain topology, 3-layer LRU, SQLite L2
 │   └── logos-mcp/             # MCP adapter: gRPC → JSON-RPC 2.0 (5 tools)
 ```

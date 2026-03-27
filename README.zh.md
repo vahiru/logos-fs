@@ -53,9 +53,15 @@ AI Agent → MCP (JSON-RPC) → gRPC 内核 → VFS 路由表 → 命名空间
 | `groups/{gid}/messages/{id}` | 单条消息 JSON | — | — |
 | `groups/{gid}/summary/{layer}/latest` | 最新摘要 | — | — |
 | `groups/{gid}/summary/{layer}/{period}` | 该期摘要 | 写入/覆盖 | **deep merge** |
+| `groups/{gid}/graph/` | 列出所有实体 | — | — |
+| `groups/{gid}/graph/{entity_id}` | 实体详情 + 关系 | 写入/upsert 实体 + 关系 | Upsert |
+| `groups/{gid}/graph/{entity_id}/relations` | 仅关系 | — | — |
 | `groups/{gid}/views/{name}` | 查询视图 | — | — |
+| `plugins/` | 列出已挂载的视图插件（名称 + 文档） | — | — |
 
 > layer = short(小时) / mid(日) / long(月)；period = ISO8601（`2026-03-20T10` / `2026-03-20` / `2026-03`）
+>
+> 记忆视图是可插拔模块（RFC 003 §11）。`summary/` 和 `graph/` 是默认插件。通过 `logos://memory/plugins/` 发现。
 
 ### 2. system
 
@@ -159,9 +165,9 @@ AI Agent → MCP (JSON-RPC) → gRPC 内核 → VFS 路由表 → 命名空间
 | 子系统 | 存储 | 职责 |
 |--------|------|------|
 | **Token Registry** | 内存（24h TTL） | 一次性 token → session 绑定；role = User / Admin；携带 agent_config_id |
-| **Session Clustering** | 内存 L0/L1 + LanceDB L2 | 基于 reply chain 的会话聚类，三层 LRU 淘汰 |
+| **Session Clustering** | 内存 L0/L1 + SQLite L2 | 基于 reply chain 的会话聚类，三层 LRU 淘汰 |
 | **Cron Scheduler** | 内存 job 表 | 60s tick，cron 表达式匹配 → 创建 pending task |
-| **Consolidator** | 注册 4 个 cron job | 渐进式记忆压缩：消息→小时摘要→日摘要；画像同理 |
+| **Consolidator** | 注册 5 个 cron job | 渐进式记忆压缩：消息→小时摘要→日摘要；画像；知识图谱 |
 | **Context Injector** | 无状态 | turn 开始前组装 session + summary + persona |
 | **VFS Middleware** | — | JsonValidator：system/ 和 memory/ 写入前验证 JSON |
 
@@ -173,6 +179,7 @@ AI Agent → MCP (JSON-RPC) → gRPC 内核 → VFS 路由表 → 命名空间
 | `consolidate-short-persona` | 每小时 :05 | 原始消息 → 用户画像观察 |
 | `consolidate-mid-summary` | 每天 03:00 | short 摘要 → mid 摘要 |
 | `consolidate-mid-persona` | 每天 03:30 | short 画像 → 重写 mid 画像 |
+| `consolidate-graph` | 每小时 :10 | 提取实体和关系 → 知识图谱 |
 
 ### Session Clustering 三层 LRU
 
@@ -180,7 +187,7 @@ AI Agent → MCP (JSON-RPC) → gRPC 内核 → VFS 路由表 → 命名空间
 |---|------|------|
 | L0 | 内存 HashMap | 活跃会话（最近有回复） |
 | L1 | 内存 HashMap | 不活跃（从 L0 LRU 淘汰） |
-| L2 | LanceDB | 归档（从 L1 淘汰时持久化，reply 时 page fault 加载回 L0） |
+| L2 | SQLite | 归档（从 L1 淘汰时持久化，reply 时 page fault 加载回 L0） |
 
 > 核心：reply chain 是硬绑定，语义相似度只是 fallback。
 
@@ -224,6 +231,6 @@ logos-fs/
 │   ├── logos-kernel/          # 内核：gRPC 实现, 命名空间挂载, Token, Cron, Consolidator, Context
 │   ├── logos-mm/              # 记忆模块：消息存储, 摘要, 视图, FTS5
 │   ├── logos-system/          # 系统模块：任务状态机, 锚点, 搜索
-│   ├── logos-session/         # 会话聚类：reply chain 拓扑, 三层 LRU, LanceDB L2
+│   ├── logos-session/         # 会话聚类：reply chain 拓扑, 三层 LRU, SQLite L2
 │   └── logos-mcp/             # MCP 适配器：gRPC → JSON-RPC 2.0（5 个工具）
 ```
