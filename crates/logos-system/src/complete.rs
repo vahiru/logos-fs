@@ -37,6 +37,12 @@ pub async fn execute(
     tasks: &TaskDb,
     params: CompleteParams,
 ) -> Result<CompleteResult, VfsError> {
+    // Auto-activate pending tasks (runtime creates as pending,
+    // agent's first complete call implicitly activates)
+    if !params.task_id.is_empty() {
+        let _ = TaskDb::transition_status(&tasks.pool, &params.task_id, "active").await;
+    }
+
     // Resume: discard current task, activate target
     if !params.resume_task_id.is_empty() {
         if !params.task_id.is_empty() {
