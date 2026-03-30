@@ -631,15 +631,17 @@ impl SandboxExecutor for ContainerdExecutor {
         create_fifo(&stdout_path)?;
         create_fifo(&stderr_path)?;
 
-        // Spawn FIFO readers BEFORE exec (prevents FIFO deadlock)
+        // Spawn FIFO readers BEFORE exec (prevents FIFO deadlock).
+        // Use incremental read instead of read_to_string — the latter blocks
+        // until EOF, but containerd shim may not close the write end promptly.
         let so = stdout_path.clone();
         let se = stderr_path.clone();
         let si = stdin_path.clone();
         let stdout_reader = tokio::spawn(async move {
-            tokio::fs::read_to_string(so).await.unwrap_or_default()
+            read_fifo_incremental(so).await
         });
         let stderr_reader = tokio::spawn(async move {
-            tokio::fs::read_to_string(se).await.unwrap_or_default()
+            read_fifo_incremental(se).await
         });
         let _stdin_writer = tokio::spawn(async move {
             let _ = tokio::fs::OpenOptions::new().write(true).open(si).await;
@@ -696,9 +698,17 @@ impl SandboxExecutor for ContainerdExecutor {
             .map_err(|e| VfsError::Io(format!("wait exec: {e}")))?;
         let exit_code = wait_resp.into_inner().exit_status as i32;
 
-        // Read stdout/stderr from FIFO readers
-        let stdout = stdout_reader.await.unwrap_or_default();
-        let stderr = stderr_reader.await.unwrap_or_default();
+        // Read stdout/stderr from FIFO readers with timeout.
+        // After wait returns, give readers a few seconds to finish draining.
+        let timeout = std::time::Duration::from_secs(5);
+        let stdout = match tokio::time::timeout(timeout, stdout_reader).await {
+            Ok(Ok(s)) => s,
+            _ => String::new(),
+        };
+        let stderr = match tokio::time::timeout(timeout, stderr_reader).await {
+            Ok(Ok(s)) => s,
+            _ => String::new(),
+        };
 
         // Cleanup
         let _ = std::fs::remove_dir_all(&tmp_dir);
@@ -749,6 +759,34 @@ impl SandboxExecutor for ContainerdExecutor {
 }
 
 /// Create a FIFO (named pipe) at the given path. Required by containerd for stdio.
+/// Read from a FIFO incrementally. Opens the FIFO, reads chunks as they arrive,
+/// and returns all collected data. Unlike read_to_string, this doesn't block
+/// waiting for EOF — it returns when the read would block (no more data).
+async fn read_fifo_incremental(path: std::path::PathBuf) -> String {
+    use tokio::io::AsyncReadExt;
+
+    let Ok(mut file) = tokio::fs::File::open(&path).await else {
+        return String::new();
+    };
+
+    let mut buf = Vec::with_capacity(8192);
+    let mut tmp = [0u8; 4096];
+    loop {
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            file.read(&mut tmp),
+        )
+        .await
+        {
+            Ok(Ok(0)) => break,            // EOF — writer closed
+            Ok(Ok(n)) => buf.extend_from_slice(&tmp[..n]),
+            Ok(Err(_)) => break,           // read error
+            Err(_) => break,               // 500ms no new data — done
+        }
+    }
+    String::from_utf8_lossy(&buf).to_string()
+}
+
 fn create_fifo(path: &std::path::Path) -> Result<(), VfsError> {
     let _ = std::fs::remove_file(path);
     let c_path = std::ffi::CString::new(path.to_string_lossy().as_bytes())
