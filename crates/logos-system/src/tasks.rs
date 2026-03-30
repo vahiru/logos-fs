@@ -84,6 +84,18 @@ impl TaskDb {
         .await
         .map_err(|e| VfsError::Sqlite(format!("insert task: {e}")))?;
 
+        // Sync FTS index
+        let description = val["description"].as_str().unwrap_or_default();
+        if !description.is_empty() {
+            let _ = sqlx::query(
+                "INSERT INTO tasks_fts(rowid, description)
+                 SELECT rowid, description FROM tasks WHERE task_id = ?1",
+            )
+            .bind(val["task_id"].as_str().unwrap_or_default())
+            .execute(&self.pool)
+            .await;
+        }
+
         Ok(())
     }
 
@@ -109,6 +121,22 @@ impl TaskDb {
             .execute(&self.pool)
             .await
             .map_err(|e| VfsError::Sqlite(format!("update description: {e}")))?;
+
+        // Sync FTS
+        let _ = sqlx::query(
+            "DELETE FROM tasks_fts WHERE rowid = (SELECT rowid FROM tasks WHERE task_id = ?1)",
+        )
+        .bind(task_id)
+        .execute(&self.pool)
+        .await;
+        let _ = sqlx::query(
+            "INSERT INTO tasks_fts(rowid, description)
+             SELECT rowid, description FROM tasks WHERE task_id = ?1",
+        )
+        .bind(task_id)
+        .execute(&self.pool)
+        .await;
+
         Ok(())
     }
 
@@ -245,6 +273,19 @@ async fn init_schema(pool: &SqlitePool) -> Result<(), VfsError> {
     .execute(pool)
     .await
     .map_err(|e| VfsError::Sqlite(format!("init tasks schema: {e}")))?;
+
+    // FTS5 index for L2 experience retrieval (RFC 003 §6.2)
+    sqlx::query(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS tasks_fts USING fts5(
+            description,
+            content=tasks,
+            content_rowid=rowid
+        )",
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| VfsError::Sqlite(format!("init tasks_fts: {e}")))?;
+
     Ok(())
 }
 
