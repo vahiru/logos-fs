@@ -46,18 +46,20 @@ pub async fn search_tasks(
         })
         .collect();
 
-    // L2 — Task description keyword match (LIKE fallback)
-    let pattern = format!("%{query}%");
+    // L2 — Task description BM25 match via FTS5 (RFC 003 §6.2)
     let l2_rows = sqlx::query(
-        "SELECT task_id, description, status, created_at FROM tasks
-         WHERE (description LIKE ?1 OR task_id LIKE ?1) AND status != 'pending'
-         ORDER BY created_at DESC LIMIT ?2",
+        "SELECT t.task_id, t.description, t.status, t.created_at
+         FROM tasks_fts f
+         JOIN tasks t ON t.rowid = f.rowid
+         WHERE tasks_fts MATCH ?1 AND t.status != 'pending'
+         ORDER BY f.rank
+         LIMIT ?2",
     )
-    .bind(&pattern)
+    .bind(&escaped_query)
     .bind(limit)
     .fetch_all(pool)
     .await
-    .map_err(|e| VfsError::Sqlite(format!("search tasks: {e}")))?;
+    .map_err(|e| VfsError::Sqlite(format!("search tasks fts: {e}")))?;
 
     let l2_hits: Vec<serde_json::Value> = l2_rows
         .iter()

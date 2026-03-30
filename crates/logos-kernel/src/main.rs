@@ -172,6 +172,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(socket_path) = parse_uds_path(&listen) {
         prepare_unix_socket(&socket_path)?;
         let listener = UnixListener::bind(&socket_path)?;
+        // Make socket accessible to non-root agents
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o777));
+        }
         println!("[logos] listening on unix://{}", socket_path.display());
         Server::builder()
             .add_service(grpc_service)

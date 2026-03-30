@@ -72,7 +72,7 @@ impl ProcStoreNs {
                 if !exists {
                     println!("[logos] cloning proc tool {tool_name} from {git_url}...");
                     let result = sandbox
-                        .exec(&format!("git clone {git_url} {sandbox_path}"), "__system__")
+                        .exec(&format!("git clone {git_url} {sandbox_path}"), "__system__", "__system__")
                         .await;
                     if let Err(e) = result {
                         eprintln!("[logos] failed to clone {tool_name}: {e}");
@@ -81,7 +81,7 @@ impl ProcStoreNs {
                 } else {
                     // Pull latest
                     if let Err(e) = sandbox
-                        .exec(&format!("cd {sandbox_path} && git pull --ff-only"), "__system__")
+                        .exec(&format!("cd {sandbox_path} && git pull --ff-only"), "__system__", "__system__")
                         .await
                     {
                         eprintln!("[logos] WARNING: git pull failed for {tool_name}: {e}");
@@ -204,7 +204,7 @@ impl ProcTool for ExternalProcTool {
             run_cmd = self.run_cmd,
         );
 
-        let result = self.sandbox.exec(&command, "__system__").await?;
+        let result = self.sandbox.exec(&command, "__system__", "__system__").await?;
 
         if result.exit_code != 0 {
             return Err(VfsError::Io(format!(

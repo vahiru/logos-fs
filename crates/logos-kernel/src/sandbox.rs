@@ -28,8 +28,8 @@ pub trait SandboxExecutor: Send + Sync {
     /// Ensure a container is running for the given agent_config_id.
     async fn ensure_container(&self, agent_config_id: &str, sock_path: Option<&PathBuf>) -> Result<ContainerInfo, VfsError>;
 
-    /// Execute a command inside the container.
-    async fn exec_in_container(&self, container_id: &str, command: &str) -> Result<ExecResult, VfsError>;
+    /// Execute a command inside the container. cwd = workspace path inside container.
+    async fn exec_in_container(&self, container_id: &str, command: &str, cwd: &str) -> Result<ExecResult, VfsError>;
 
     /// Stop and remove a container.
     async fn remove_container(&self, container_id: &str) -> Result<(), VfsError>;
@@ -37,16 +37,17 @@ pub trait SandboxExecutor: Send + Sync {
 
 /// Sandbox namespace — `logos://sandbox/`.
 ///
-/// RFC 002 §5: sandbox paths are mapped via overlayfs. The container's rootfs
-/// IS the workspace. Files written to the overlayfs upperdir are visible inside
-/// the container. Multiple tasks from the same agent share one container.
+/// Container is shared per agent_config_id. Each task gets its own subdirectory
+/// under /workspace/{task_id}/ inside the container. URI routing ensures agents
+/// can only access their own task's directory.
 ///
-/// - **read/write/patch**: operate on the host filesystem directly (via bind mount)
-/// - **exec**: runs commands inside the container
+/// - **read/write/patch**: operate on per-task directory in overlayfs upperdir
+/// - **exec**: runs commands in container, cwd = /workspace/{task_id}/
 pub struct SandboxNs {
     executor: Box<dyn SandboxExecutor>,
     host_root: PathBuf,
-    containers: Mutex<HashMap<String, ContainerInfo>>, // agent_config_id → info
+    containers: Mutex<HashMap<String, ContainerInfo>>,  // agent_config_id → info
+    task_agent: Mutex<HashMap<String, String>>,          // task_id → agent_config_id
 }
 
 impl SandboxNs {
@@ -63,6 +64,7 @@ impl SandboxNs {
             executor,
             host_root,
             containers: Mutex::new(HashMap::new()),
+            task_agent: Mutex::new(HashMap::new()),
         })
     }
 
@@ -86,6 +88,42 @@ impl SandboxNs {
         Ok(info)
     }
 
+    /// Resolve a sandbox path to the per-task directory inside the correct container's overlayfs.
+    /// path[0] = task_id, path[1..] = file path within that task's workspace.
+    async fn resolve_path(&self, path: &[&str]) -> Result<PathBuf, VfsError> {
+        if path.first().map(|s| *s) == Some("__system__") {
+            return Ok(self.host_root.join(path.join("/")));
+        }
+
+        let task_id = *path.first().ok_or_else(|| VfsError::InvalidPath("empty sandbox path".to_string()))?;
+
+        // Look up which agent owns this task, then find that agent's container
+        let agent_id = self.task_agent.lock().await.get(task_id).cloned()
+            .ok_or_else(|| VfsError::Io(format!("no agent registered for task {task_id}")))?;
+
+        let containers = self.containers.lock().await;
+        let info = containers.get(&agent_id)
+            .ok_or_else(|| VfsError::Io(format!("no container for agent {agent_id}")))?;
+
+        let task_dir = info.host_path.join(task_id);
+        std::fs::create_dir_all(&task_dir)
+            .map_err(|e| VfsError::Io(format!("create task dir {task_id}: {e}")))?;
+
+        if path.len() > 1 {
+            Ok(task_dir.join(path[1..].join("/")))
+        } else {
+            Ok(task_dir)
+        }
+    }
+
+    /// Pre-create a container and register task → agent mapping.
+    /// Called at handshake time so the sandbox is ready before first read/write/exec.
+    pub async fn ensure_container_for(&self, agent_config_id: &str, task_id: &str) -> Result<(), VfsError> {
+        self.ensure_container(agent_config_id).await?;
+        self.task_agent.lock().await.insert(task_id.to_string(), agent_config_id.to_string());
+        Ok(())
+    }
+
     fn translate_service_uris(&self, command: &str) -> String {
         let host_root_str = self.host_root.to_string_lossy();
         command.replace(
@@ -106,23 +144,27 @@ impl SandboxNs {
         None
     }
 
-    pub async fn exec(&self, command: &str, agent_config_id: &str) -> Result<ExecResult, VfsError> {
+    pub async fn exec(&self, command: &str, agent_config_id: &str, task_id: &str) -> Result<ExecResult, VfsError> {
         let info = self.ensure_container(agent_config_id).await?;
 
-        let task_id = Self::extract_task_id(command)
-            .unwrap_or_else(|| agent_config_id.to_string());
+        // Ensure per-task directory exists inside container
+        let task_workspace = format!("{CONTAINER_WORKDIR}/{task_id}");
+        // Create task dir on host side so it's visible in container
+        let task_dir_host = info.host_path.join(task_id);
+        std::fs::create_dir_all(&task_dir_host)
+            .map_err(|e| VfsError::Io(format!("create task dir {task_id}: {e}")))?;
 
         let translated = command.replace(
             &format!("logos://sandbox/{task_id}/"),
-            &format!("{CONTAINER_WORKDIR}/"),
+            &format!("{task_workspace}/"),
         );
         let translated = translated.replace(
             &format!("logos://sandbox/{task_id}"),
-            CONTAINER_WORKDIR,
+            &task_workspace,
         );
         let translated = self.translate_service_uris(&translated);
 
-        self.executor.exec_in_container(&info.container_id, &translated).await
+        self.executor.exec_in_container(&info.container_id, &translated, &task_workspace).await
     }
 }
 
@@ -136,7 +178,7 @@ impl Namespace for SandboxNs {
         if path.is_empty() {
             return Err(VfsError::InvalidPath("empty sandbox path".to_string()));
         }
-        let file_path = self.host_root.join(path.join("/"));
+        let file_path = self.resolve_path(path).await?;
 
         if file_path.is_dir() {
             let mut entries = Vec::new();
@@ -164,7 +206,7 @@ impl Namespace for SandboxNs {
         if path.is_empty() {
             return Err(VfsError::InvalidPath("empty sandbox path".to_string()));
         }
-        let file_path = self.host_root.join(path.join("/"));
+        let file_path = self.resolve_path(path).await?;
 
         if let Some(parent) = file_path.parent() {
             tokio::fs::create_dir_all(parent)
@@ -179,7 +221,7 @@ impl Namespace for SandboxNs {
 
     async fn patch(&self, path: &[&str], partial: &str) -> Result<(), VfsError> {
         if path.last().map(|s| *s) == Some("log") {
-            let file_path = self.host_root.join(path.join("/"));
+            let file_path = self.resolve_path(path).await?;
             if let Some(parent) = file_path.parent() {
                 tokio::fs::create_dir_all(parent)
                     .await
@@ -586,7 +628,7 @@ impl SandboxExecutor for ContainerdExecutor {
         })
     }
 
-    async fn exec_in_container(&self, container_id: &str, command: &str) -> Result<ExecResult, VfsError> {
+    async fn exec_in_container(&self, container_id: &str, command: &str, cwd: &str) -> Result<ExecResult, VfsError> {
         let exec_id = format!("exec-{}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0));
 
         let tmp_dir = std::env::temp_dir().join(format!("logos-exec-{exec_id}"));
@@ -601,24 +643,25 @@ impl SandboxExecutor for ContainerdExecutor {
         create_fifo(&stdout_path)?;
         create_fifo(&stderr_path)?;
 
-        // Spawn FIFO readers BEFORE exec (prevents FIFO deadlock)
+        // Spawn FIFO readers BEFORE exec (prevents FIFO deadlock).
+        // Use incremental read instead of read_to_string — the latter blocks
+        // until EOF, but containerd shim may not close the write end promptly.
         let so = stdout_path.clone();
         let se = stderr_path.clone();
         let si = stdin_path.clone();
         let stdout_reader = tokio::spawn(async move {
-            tokio::fs::read_to_string(so).await.unwrap_or_default()
+            read_fifo_incremental(so).await
         });
         let stderr_reader = tokio::spawn(async move {
-            tokio::fs::read_to_string(se).await.unwrap_or_default()
+            read_fifo_incremental(se).await
         });
         let _stdin_writer = tokio::spawn(async move {
             let _ = tokio::fs::OpenOptions::new().write(true).open(si).await;
         });
 
         // Build exec process spec
-        // runc exec checks cwd before bind mounts are visible, so use / as cwd
-        // and prepend cd /workspace to the command
-        let full_cmd = format!("cd /workspace && {command}");
+        // Ensure task dir exists inside container, then cd into it
+        let full_cmd = format!("mkdir -p {cwd} && cd {cwd} && {command}");
         let process_spec = serde_json::json!({
             "terminal": false,
             "user": {"uid": 0, "gid": 0},
@@ -666,9 +709,17 @@ impl SandboxExecutor for ContainerdExecutor {
             .map_err(|e| VfsError::Io(format!("wait exec: {e}")))?;
         let exit_code = wait_resp.into_inner().exit_status as i32;
 
-        // Read stdout/stderr from FIFO readers
-        let stdout = stdout_reader.await.unwrap_or_default();
-        let stderr = stderr_reader.await.unwrap_or_default();
+        // Read stdout/stderr from FIFO readers with timeout.
+        // After wait returns, give readers a few seconds to finish draining.
+        let timeout = std::time::Duration::from_secs(5);
+        let stdout = match tokio::time::timeout(timeout, stdout_reader).await {
+            Ok(Ok(s)) => s,
+            _ => String::new(),
+        };
+        let stderr = match tokio::time::timeout(timeout, stderr_reader).await {
+            Ok(Ok(s)) => s,
+            _ => String::new(),
+        };
 
         // Cleanup
         let _ = std::fs::remove_dir_all(&tmp_dir);
@@ -719,6 +770,34 @@ impl SandboxExecutor for ContainerdExecutor {
 }
 
 /// Create a FIFO (named pipe) at the given path. Required by containerd for stdio.
+/// Read from a FIFO incrementally. Opens the FIFO, reads chunks as they arrive,
+/// and returns all collected data. Unlike read_to_string, this doesn't block
+/// waiting for EOF — it returns when the read would block (no more data).
+async fn read_fifo_incremental(path: std::path::PathBuf) -> String {
+    use tokio::io::AsyncReadExt;
+
+    let Ok(mut file) = tokio::fs::File::open(&path).await else {
+        return String::new();
+    };
+
+    let mut buf = Vec::with_capacity(8192);
+    let mut tmp = [0u8; 4096];
+    loop {
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            file.read(&mut tmp),
+        )
+        .await
+        {
+            Ok(Ok(0)) => break,            // EOF — writer closed
+            Ok(Ok(n)) => buf.extend_from_slice(&tmp[..n]),
+            Ok(Err(_)) => break,           // read error
+            Err(_) => break,               // 500ms no new data — done
+        }
+    }
+    String::from_utf8_lossy(&buf).to_string()
+}
+
 fn create_fifo(path: &std::path::Path) -> Result<(), VfsError> {
     let _ = std::fs::remove_file(path);
     let c_path = std::ffi::CString::new(path.to_string_lossy().as_bytes())
@@ -767,7 +846,7 @@ mod tests {
         let info = sandbox.ensure_container("test-exec").await.unwrap();
         assert!(!info.container_id.is_empty());
 
-        let result = sandbox.exec("echo 'hello from sandbox'", "test-exec").await.unwrap();
+        let result = sandbox.exec("echo 'hello from sandbox'", "test-exec", "test-exec").await.unwrap();
         assert_eq!(result.exit_code, 0);
         assert!(result.stdout.contains("hello from sandbox"));
 
@@ -789,7 +868,7 @@ mod tests {
 
         // Exec inside container should see the file
         let result = sandbox
-            .exec("cat /workspace/hello.txt", "test-vis")
+            .exec("cat /workspace/test-vis/hello.txt", "test-vis", "test-vis")
             .await
             .unwrap();
         assert_eq!(result.exit_code, 0, "stderr: {}", result.stderr);
@@ -811,7 +890,7 @@ mod tests {
 
         // URI translation: logos://sandbox/test-uri/data.txt → /workspace/data.txt
         let result = sandbox
-            .exec("cat logos://sandbox/test-uri/data.txt", "test-uri")
+            .exec("cat logos://sandbox/test-uri/data.txt", "test-uri", "test-uri")
             .await
             .unwrap();
         assert_eq!(result.exit_code, 0, "stderr: {}", result.stderr);
