@@ -28,8 +28,8 @@ pub trait SandboxExecutor: Send + Sync {
     /// Ensure a container is running for the given agent_config_id.
     async fn ensure_container(&self, agent_config_id: &str, sock_path: Option<&PathBuf>) -> Result<ContainerInfo, VfsError>;
 
-    /// Execute a command inside the container.
-    async fn exec_in_container(&self, container_id: &str, command: &str) -> Result<ExecResult, VfsError>;
+    /// Execute a command inside the container. cwd = workspace path inside container.
+    async fn exec_in_container(&self, container_id: &str, command: &str, cwd: &str) -> Result<ExecResult, VfsError>;
 
     /// Stop and remove a container.
     async fn remove_container(&self, container_id: &str) -> Result<(), VfsError>;
@@ -37,16 +37,17 @@ pub trait SandboxExecutor: Send + Sync {
 
 /// Sandbox namespace — `logos://sandbox/`.
 ///
-/// RFC 002 §5: sandbox paths are mapped via overlayfs. The container's rootfs
-/// IS the workspace. Files written to the overlayfs upperdir are visible inside
-/// the container. Multiple tasks from the same agent share one container.
+/// Container is shared per agent_config_id. Each task gets its own subdirectory
+/// under /workspace/{task_id}/ inside the container. URI routing ensures agents
+/// can only access their own task's directory.
 ///
-/// - **read/write/patch**: operate on the host filesystem directly (via bind mount)
-/// - **exec**: runs commands inside the container
+/// - **read/write/patch**: operate on per-task directory in overlayfs upperdir
+/// - **exec**: runs commands in container, cwd = /workspace/{task_id}/
 pub struct SandboxNs {
     executor: Box<dyn SandboxExecutor>,
     host_root: PathBuf,
-    containers: Mutex<HashMap<String, ContainerInfo>>, // agent_config_id → info
+    containers: Mutex<HashMap<String, ContainerInfo>>,  // agent_config_id → info
+    task_agent: Mutex<HashMap<String, String>>,          // task_id → agent_config_id
 }
 
 impl SandboxNs {
@@ -63,6 +64,7 @@ impl SandboxNs {
             executor,
             host_root,
             containers: Mutex::new(HashMap::new()),
+            task_agent: Mutex::new(HashMap::new()),
         })
     }
 
@@ -86,33 +88,39 @@ impl SandboxNs {
         Ok(info)
     }
 
-    /// Resolve a sandbox path to the overlayfs workspace inside a container.
-    /// All sandbox file operations go through the container's overlayfs — no exceptions.
+    /// Resolve a sandbox path to the per-task directory inside the correct container's overlayfs.
+    /// path[0] = task_id, path[1..] = file path within that task's workspace.
     async fn resolve_path(&self, path: &[&str]) -> Result<PathBuf, VfsError> {
-        // __system__ paths use host_root (these are kernel-managed, not agent workspace)
         if path.first().map(|s| *s) == Some("__system__") {
             return Ok(self.host_root.join(path.join("/")));
         }
 
-        // path[0] is task_id. Containers are keyed by agent_config_id.
-        // Find the container and use its overlayfs host_path.
-        let containers = self.containers.lock().await;
-        for (_agent_id, info) in containers.iter() {
-            // host_path = overlayfs upperdir/workspace
-            // Files here are visible inside the container at /workspace/
-            if path.len() > 1 {
-                return Ok(info.host_path.join(path[1..].join("/")));
-            }
-            return Ok(info.host_path.clone());
-        }
+        let task_id = *path.first().ok_or_else(|| VfsError::InvalidPath("empty sandbox path".to_string()))?;
 
-        Err(VfsError::Io("no container running — cannot access sandbox files".to_string()))
+        // Look up which agent owns this task, then find that agent's container
+        let agent_id = self.task_agent.lock().await.get(task_id).cloned()
+            .ok_or_else(|| VfsError::Io(format!("no agent registered for task {task_id}")))?;
+
+        let containers = self.containers.lock().await;
+        let info = containers.get(&agent_id)
+            .ok_or_else(|| VfsError::Io(format!("no container for agent {agent_id}")))?;
+
+        let task_dir = info.host_path.join(task_id);
+        std::fs::create_dir_all(&task_dir)
+            .map_err(|e| VfsError::Io(format!("create task dir {task_id}: {e}")))?;
+
+        if path.len() > 1 {
+            Ok(task_dir.join(path[1..].join("/")))
+        } else {
+            Ok(task_dir)
+        }
     }
 
-    /// Pre-create a container for an agent. Called at handshake time so the
-    /// sandbox is ready before the agent's first read/write/exec.
-    pub async fn ensure_container_for(&self, agent_config_id: &str) -> Result<(), VfsError> {
+    /// Pre-create a container and register task → agent mapping.
+    /// Called at handshake time so the sandbox is ready before first read/write/exec.
+    pub async fn ensure_container_for(&self, agent_config_id: &str, task_id: &str) -> Result<(), VfsError> {
         self.ensure_container(agent_config_id).await?;
+        self.task_agent.lock().await.insert(task_id.to_string(), agent_config_id.to_string());
         Ok(())
     }
 
@@ -136,23 +144,27 @@ impl SandboxNs {
         None
     }
 
-    pub async fn exec(&self, command: &str, agent_config_id: &str) -> Result<ExecResult, VfsError> {
+    pub async fn exec(&self, command: &str, agent_config_id: &str, task_id: &str) -> Result<ExecResult, VfsError> {
         let info = self.ensure_container(agent_config_id).await?;
 
-        let task_id = Self::extract_task_id(command)
-            .unwrap_or_else(|| agent_config_id.to_string());
+        // Ensure per-task directory exists inside container
+        let task_workspace = format!("{CONTAINER_WORKDIR}/{task_id}");
+        // Create task dir on host side so it's visible in container
+        let task_dir_host = info.host_path.join(task_id);
+        std::fs::create_dir_all(&task_dir_host)
+            .map_err(|e| VfsError::Io(format!("create task dir {task_id}: {e}")))?;
 
         let translated = command.replace(
             &format!("logos://sandbox/{task_id}/"),
-            &format!("{CONTAINER_WORKDIR}/"),
+            &format!("{task_workspace}/"),
         );
         let translated = translated.replace(
             &format!("logos://sandbox/{task_id}"),
-            CONTAINER_WORKDIR,
+            &task_workspace,
         );
         let translated = self.translate_service_uris(&translated);
 
-        self.executor.exec_in_container(&info.container_id, &translated).await
+        self.executor.exec_in_container(&info.container_id, &translated, &task_workspace).await
     }
 }
 
@@ -616,7 +628,7 @@ impl SandboxExecutor for ContainerdExecutor {
         })
     }
 
-    async fn exec_in_container(&self, container_id: &str, command: &str) -> Result<ExecResult, VfsError> {
+    async fn exec_in_container(&self, container_id: &str, command: &str, cwd: &str) -> Result<ExecResult, VfsError> {
         let exec_id = format!("exec-{}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0));
 
         let tmp_dir = std::env::temp_dir().join(format!("logos-exec-{exec_id}"));
@@ -648,9 +660,8 @@ impl SandboxExecutor for ContainerdExecutor {
         });
 
         // Build exec process spec
-        // runc exec checks cwd before bind mounts are visible, so use / as cwd
-        // and prepend cd /workspace to the command
-        let full_cmd = format!("cd /workspace && {command}");
+        // Ensure task dir exists inside container, then cd into it
+        let full_cmd = format!("mkdir -p {cwd} && cd {cwd} && {command}");
         let process_spec = serde_json::json!({
             "terminal": false,
             "user": {"uid": 0, "gid": 0},
@@ -835,7 +846,7 @@ mod tests {
         let info = sandbox.ensure_container("test-exec").await.unwrap();
         assert!(!info.container_id.is_empty());
 
-        let result = sandbox.exec("echo 'hello from sandbox'", "test-exec").await.unwrap();
+        let result = sandbox.exec("echo 'hello from sandbox'", "test-exec", "test-exec").await.unwrap();
         assert_eq!(result.exit_code, 0);
         assert!(result.stdout.contains("hello from sandbox"));
 
@@ -857,7 +868,7 @@ mod tests {
 
         // Exec inside container should see the file
         let result = sandbox
-            .exec("cat /workspace/hello.txt", "test-vis")
+            .exec("cat /workspace/test-vis/hello.txt", "test-vis", "test-vis")
             .await
             .unwrap();
         assert_eq!(result.exit_code, 0, "stderr: {}", result.stderr);
@@ -879,7 +890,7 @@ mod tests {
 
         // URI translation: logos://sandbox/test-uri/data.txt → /workspace/data.txt
         let result = sandbox
-            .exec("cat logos://sandbox/test-uri/data.txt", "test-uri")
+            .exec("cat logos://sandbox/test-uri/data.txt", "test-uri", "test-uri")
             .await
             .unwrap();
         assert_eq!(result.exit_code, 0, "stderr: {}", result.stderr);

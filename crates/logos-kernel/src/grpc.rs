@@ -65,15 +65,23 @@ async fn check_access(
                         si.task_id
                     )));
                 }
-                // Read access: only if target task is finished
-                if let Ok(Some(task_json)) = system.get_task(uri_task).await {
-                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(&task_json) {
-                        if val["status"].as_str() != Some("finished") {
-                            return Err(Status::permission_denied(format!(
-                                "task {} cannot read active sandbox of {uri_task}",
-                                si.task_id
-                            )));
+                // Read access: only if target task exists and is finished
+                match system.get_task(uri_task).await {
+                    Ok(Some(task_json)) => {
+                        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&task_json) {
+                            if val["status"].as_str() != Some("finished") {
+                                return Err(Status::permission_denied(format!(
+                                    "task {} cannot read active sandbox of {uri_task}",
+                                    si.task_id
+                                )));
+                            }
                         }
+                    }
+                    _ => {
+                        return Err(Status::permission_denied(format!(
+                            "task {} cannot access sandbox of unknown task {uri_task}",
+                            si.task_id
+                        )));
                     }
                 }
             }
@@ -169,7 +177,7 @@ impl Logos for LogosService {
         // No session = no exec (management interface doesn't need exec)
         let si = info.ok_or_else(|| Status::unauthenticated("exec requires a valid session"))?;
         let command = request.into_inner().command;
-        let result = self.sandbox.exec(&command, &si.agent_config_id).await.map_err(vfs_to_status)?;
+        let result = self.sandbox.exec(&command, &si.agent_config_id, &si.task_id).await.map_err(vfs_to_status)?;
         Ok(Response::new(ExecRes {
             stdout: result.stdout,
             stderr: result.stderr,
@@ -196,10 +204,10 @@ impl Logos for LogosService {
     ) -> Result<Response<HandshakeRes>, Status> {
         let token = request.into_inner().token;
         match self.tokens.consume(&token).await {
-            Some((session_key, _task_id, agent_config_id)) => {
-                // Pre-create container so sandbox is ready before first read/write/exec
+            Some((session_key, task_id, agent_config_id)) => {
+                // Pre-create container + register task → agent mapping
                 if !agent_config_id.is_empty() {
-                    if let Err(e) = self.sandbox.ensure_container_for(&agent_config_id).await {
+                    if let Err(e) = self.sandbox.ensure_container_for(&agent_config_id, &task_id).await {
                         eprintln!("[logos] WARNING: pre-create container failed for {agent_config_id}: {e}");
                     }
                 }
