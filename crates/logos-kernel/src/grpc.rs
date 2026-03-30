@@ -102,6 +102,21 @@ async fn check_access(
     Ok(())
 }
 
+/// Auto-scope relative paths to the agent's sandbox.
+/// Paths without `logos://` prefix are treated as relative to `logos://sandbox/{task_id}/`.
+fn resolve_uri(uri: &str, info: Option<&SessionInfo>) -> String {
+    if uri.starts_with("logos://") {
+        return uri.to_string();
+    }
+    // Relative path — scope to agent's sandbox
+    if let Some(si) = info {
+        let trimmed = uri.trim_start_matches("./").trim_start_matches('/');
+        return format!("logos://sandbox/{}/{}", si.task_id, trimmed);
+    }
+    // No session — pass through (will likely fail at routing)
+    uri.to_string()
+}
+
 fn vfs_to_status(e: VfsError) -> Status {
     match &e {
         VfsError::InvalidUri(_) | VfsError::InvalidPath(_) | VfsError::InvalidJson(_) => {
@@ -119,7 +134,7 @@ fn vfs_to_status(e: VfsError) -> Status {
 impl Logos for LogosService {
     async fn read(&self, request: Request<ReadReq>) -> Result<Response<ReadRes>, Status> {
         let info = extract_session_info(&self.tokens, &request).await;
-        let uri = request.into_inner().uri;
+        let uri = resolve_uri(&request.into_inner().uri, info.as_ref());
         check_access(info.as_ref(), &uri, false, &self.system).await?;
         let content = self.table.read(&uri).await.map_err(vfs_to_status)?;
         Ok(Response::new(ReadRes { content }))
@@ -128,9 +143,10 @@ impl Logos for LogosService {
     async fn write(&self, request: Request<WriteReq>) -> Result<Response<WriteRes>, Status> {
         let info = extract_session_info(&self.tokens, &request).await;
         let req = request.into_inner();
-        check_access(info.as_ref(), &req.uri, true, &self.system).await?;
+        let uri = resolve_uri(&req.uri, info.as_ref());
+        check_access(info.as_ref(), &uri, true, &self.system).await?;
         self.table
-            .write(&req.uri, &req.content)
+            .write(&uri, &req.content)
             .await
             .map_err(vfs_to_status)?;
         Ok(Response::new(WriteRes {}))
@@ -139,9 +155,10 @@ impl Logos for LogosService {
     async fn patch(&self, request: Request<PatchReq>) -> Result<Response<PatchRes>, Status> {
         let info = extract_session_info(&self.tokens, &request).await;
         let req = request.into_inner();
-        check_access(info.as_ref(), &req.uri, true, &self.system).await?;
+        let uri = resolve_uri(&req.uri, info.as_ref());
+        check_access(info.as_ref(), &uri, true, &self.system).await?;
         self.table
-            .patch(&req.uri, &req.partial)
+            .patch(&uri, &req.partial)
             .await
             .map_err(vfs_to_status)?;
         Ok(Response::new(PatchRes {}))
@@ -179,7 +196,14 @@ impl Logos for LogosService {
     ) -> Result<Response<HandshakeRes>, Status> {
         let token = request.into_inner().token;
         match self.tokens.consume(&token).await {
-            Some((session_key, _task_id)) => {
+            Some((session_key, _task_id, agent_config_id)) => {
+                // Pre-create container so sandbox is ready before first read/write/exec
+                if !agent_config_id.is_empty() {
+                    if let Err(e) = self.sandbox.ensure_container_for(&agent_config_id).await {
+                        eprintln!("[logos] WARNING: pre-create container failed for {agent_config_id}: {e}");
+                    }
+                }
+
                 let mut res = Response::new(HandshakeRes {
                     ok: true,
                     error: String::new(),

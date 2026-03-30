@@ -93,13 +93,15 @@ impl TokenRegistry {
         self.pending.write().await.remove(token);
     }
 
-    pub async fn consume(&self, token: &str) -> Option<(String, String)> {
+    /// Consume a one-time token. Returns (session_key, task_id, agent_config_id).
+    pub async fn consume(&self, token: &str) -> Option<(String, String, String)> {
         let entry = self.pending.write().await.remove(token)?;
         let session_key = format!(
             "s-{}",
             self.counter
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         );
+        let agent_config_id = entry.agent_config_id.clone();
         self.sessions.write().await.insert(
             session_key.clone(),
             SessionEntry {
@@ -109,7 +111,7 @@ impl TokenRegistry {
                 created_at: Instant::now(),
             },
         );
-        Some((session_key, entry.task_id))
+        Some((session_key, entry.task_id, agent_config_id))
     }
 
     /// Resolve a session key to task_id (backward compat).

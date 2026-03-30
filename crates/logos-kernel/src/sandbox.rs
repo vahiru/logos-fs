@@ -86,6 +86,36 @@ impl SandboxNs {
         Ok(info)
     }
 
+    /// Resolve a sandbox path to the overlayfs workspace inside a container.
+    /// All sandbox file operations go through the container's overlayfs — no exceptions.
+    async fn resolve_path(&self, path: &[&str]) -> Result<PathBuf, VfsError> {
+        // __system__ paths use host_root (these are kernel-managed, not agent workspace)
+        if path.first().map(|s| *s) == Some("__system__") {
+            return Ok(self.host_root.join(path.join("/")));
+        }
+
+        // path[0] is task_id. Containers are keyed by agent_config_id.
+        // Find the container and use its overlayfs host_path.
+        let containers = self.containers.lock().await;
+        for (_agent_id, info) in containers.iter() {
+            // host_path = overlayfs upperdir/workspace
+            // Files here are visible inside the container at /workspace/
+            if path.len() > 1 {
+                return Ok(info.host_path.join(path[1..].join("/")));
+            }
+            return Ok(info.host_path.clone());
+        }
+
+        Err(VfsError::Io("no container running — cannot access sandbox files".to_string()))
+    }
+
+    /// Pre-create a container for an agent. Called at handshake time so the
+    /// sandbox is ready before the agent's first read/write/exec.
+    pub async fn ensure_container_for(&self, agent_config_id: &str) -> Result<(), VfsError> {
+        self.ensure_container(agent_config_id).await?;
+        Ok(())
+    }
+
     fn translate_service_uris(&self, command: &str) -> String {
         let host_root_str = self.host_root.to_string_lossy();
         command.replace(
@@ -136,7 +166,7 @@ impl Namespace for SandboxNs {
         if path.is_empty() {
             return Err(VfsError::InvalidPath("empty sandbox path".to_string()));
         }
-        let file_path = self.host_root.join(path.join("/"));
+        let file_path = self.resolve_path(path).await?;
 
         if file_path.is_dir() {
             let mut entries = Vec::new();
@@ -164,7 +194,7 @@ impl Namespace for SandboxNs {
         if path.is_empty() {
             return Err(VfsError::InvalidPath("empty sandbox path".to_string()));
         }
-        let file_path = self.host_root.join(path.join("/"));
+        let file_path = self.resolve_path(path).await?;
 
         if let Some(parent) = file_path.parent() {
             tokio::fs::create_dir_all(parent)
@@ -179,7 +209,7 @@ impl Namespace for SandboxNs {
 
     async fn patch(&self, path: &[&str], partial: &str) -> Result<(), VfsError> {
         if path.last().map(|s| *s) == Some("log") {
-            let file_path = self.host_root.join(path.join("/"));
+            let file_path = self.resolve_path(path).await?;
             if let Some(parent) = file_path.parent() {
                 tokio::fs::create_dir_all(parent)
                     .await
