@@ -55,10 +55,14 @@ impl SandboxNs {
         std::fs::create_dir_all(&host_root)
             .map_err(|e| VfsError::Io(format!("create sandbox dir: {e}")))?;
 
-        let executor: Box<dyn SandboxExecutor> = Box::new(
-            ContainerdExecutor::try_init(image).await?
-        );
-        println!("[logos] sandbox: using containerd");
+        let mode = std::env::var("SANDBOX_MODE").unwrap_or_default();
+        let executor: Box<dyn SandboxExecutor> = if mode.eq_ignore_ascii_case("host") {
+            println!("[logos] sandbox: using host executor (no container isolation)");
+            Box::new(HostExecutor::new(host_root.clone()))
+        } else {
+            println!("[logos] sandbox: using containerd");
+            Box::new(ContainerdExecutor::try_init(image).await?)
+        };
 
         Ok(Self {
             executor,
@@ -243,6 +247,75 @@ impl Namespace for SandboxNs {
             return Ok(());
         }
         self.write(path, partial).await
+    }
+}
+
+// =============================================================================
+// Host executor — direct local execution, no container isolation.
+// Enabled via SANDBOX_MODE=host. Useful for running inside an already-sandboxed
+// environment (e.g. Harbor/Docker benchmark containers).
+// =============================================================================
+
+struct HostExecutor {
+    root: PathBuf,
+}
+
+impl HostExecutor {
+    fn new(root: PathBuf) -> Self {
+        Self { root }
+    }
+}
+
+#[async_trait]
+impl SandboxExecutor for HostExecutor {
+    async fn ensure_container(&self, agent_config_id: &str, _sock_path: Option<&PathBuf>) -> Result<ContainerInfo, VfsError> {
+        let workspace = self.root.join(agent_config_id);
+        std::fs::create_dir_all(&workspace)
+            .map_err(|e| VfsError::Io(format!("create host workspace {agent_config_id}: {e}")))?;
+        Ok(ContainerInfo {
+            container_id: format!("host-{agent_config_id}"),
+            host_path: workspace,
+        })
+    }
+
+    async fn exec_in_container(&self, container_id: &str, command: &str, cwd: &str) -> Result<ExecResult, VfsError> {
+        // container_id is "host-{agent_config_id}", resolve workspace from root
+        let agent_id = container_id.strip_prefix("host-").unwrap_or(container_id);
+        let workspace = self.root.join(agent_id);
+
+        // Map /workspace/... paths to the actual host workspace directory
+        let actual_cwd = if cwd.starts_with(CONTAINER_WORKDIR) {
+            let relative = cwd.strip_prefix(CONTAINER_WORKDIR).unwrap_or("");
+            let relative = relative.strip_prefix('/').unwrap_or(relative);
+            if relative.is_empty() {
+                workspace.clone()
+            } else {
+                workspace.join(relative)
+            }
+        } else {
+            PathBuf::from(cwd)
+        };
+
+        std::fs::create_dir_all(&actual_cwd)
+            .map_err(|e| VfsError::Io(format!("create cwd {}: {e}", actual_cwd.display())))?;
+
+        let output = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg(command)
+            .current_dir(&actual_cwd)
+            .output()
+            .await
+            .map_err(|e| VfsError::Io(format!("exec host command: {e}")))?;
+
+        Ok(ExecResult {
+            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+            exit_code: output.status.code().unwrap_or(-1),
+        })
+    }
+
+    async fn remove_container(&self, _container_id: &str) -> Result<(), VfsError> {
+        Ok(()) // noop — no container to remove
     }
 }
 
