@@ -104,6 +104,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }));
     proc_ns.register(Arc::new(builtin_tools::WebSearchTool::new()));
 
+    // 6b. pinchtab — optional browser control
+    let mut pinchtab_child = builtin_tools::browse::spawn_pinchtab().await;
+    if pinchtab_child.is_some() {
+        proc_ns.register(Arc::new(builtin_tools::BrowseTool::new(
+            "http://127.0.0.1:9867".to_string(),
+        )));
+        println!("[logos] registered browse tool (pinchtab)");
+    }
+
     // 7. proc-store/ — persistent proc tool declarations
     let proc_store_root = env_path("VFS_PROC_STORE_ROOT", "../../data/state/proc-store");
     let proc_store_ns = proc_store::ProcStoreNs::init(proc_store_root)?;
@@ -193,6 +202,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await?;
     }
 
+    // Cleanup: stop pinchtab if we spawned it
+    if let Some(ref mut child) = pinchtab_child {
+        println!("[logos] stopping pinchtab...");
+        let _ = child.kill().await;
+    }
+
     Ok(())
 }
 
@@ -257,7 +272,9 @@ fn env_path(key: &str, default: &str) -> PathBuf {
     if let Ok(val) = std::env::var(key) {
         return PathBuf::from(val);
     }
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(default)
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(default);
+    // Canonicalize to resolve ../../ — avoids exceeding macOS SUN_LEN (104) for UDS paths
+    path.canonicalize().unwrap_or(path)
 }
 
 fn parse_uds_path(listen: &str) -> Option<PathBuf> {
