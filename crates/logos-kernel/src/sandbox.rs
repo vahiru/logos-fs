@@ -55,10 +55,14 @@ impl SandboxNs {
         std::fs::create_dir_all(&host_root)
             .map_err(|e| VfsError::Io(format!("create sandbox dir: {e}")))?;
 
-        let executor: Box<dyn SandboxExecutor> = Box::new(
-            ContainerdExecutor::try_init(image).await?
-        );
-        println!("[logos] sandbox: using containerd");
+        let mode = std::env::var("SANDBOX_MODE").unwrap_or_default();
+        let executor: Box<dyn SandboxExecutor> = if mode.eq_ignore_ascii_case("host") {
+            println!("[logos] sandbox: using host executor (no container isolation)");
+            Box::new(HostExecutor::new(host_root.clone()))
+        } else {
+            println!("[logos] sandbox: using containerd");
+            Box::new(ContainerdExecutor::try_init(image).await?)
+        };
 
         Ok(Self {
             executor,
@@ -247,6 +251,75 @@ impl Namespace for SandboxNs {
 }
 
 // =============================================================================
+// Host executor — direct local execution, no container isolation.
+// Enabled via SANDBOX_MODE=host. Useful for running inside an already-sandboxed
+// environment (e.g. Harbor/Docker benchmark containers).
+// =============================================================================
+
+struct HostExecutor {
+    root: PathBuf,
+}
+
+impl HostExecutor {
+    fn new(root: PathBuf) -> Self {
+        Self { root }
+    }
+}
+
+#[async_trait]
+impl SandboxExecutor for HostExecutor {
+    async fn ensure_container(&self, agent_config_id: &str, _sock_path: Option<&PathBuf>) -> Result<ContainerInfo, VfsError> {
+        let workspace = self.root.join(agent_config_id);
+        std::fs::create_dir_all(&workspace)
+            .map_err(|e| VfsError::Io(format!("create host workspace {agent_config_id}: {e}")))?;
+        Ok(ContainerInfo {
+            container_id: format!("host-{agent_config_id}"),
+            host_path: workspace,
+        })
+    }
+
+    async fn exec_in_container(&self, container_id: &str, command: &str, cwd: &str) -> Result<ExecResult, VfsError> {
+        // container_id is "host-{agent_config_id}", resolve workspace from root
+        let agent_id = container_id.strip_prefix("host-").unwrap_or(container_id);
+        let workspace = self.root.join(agent_id);
+
+        // Map /workspace/... paths to the actual host workspace directory
+        let actual_cwd = if cwd.starts_with(CONTAINER_WORKDIR) {
+            let relative = cwd.strip_prefix(CONTAINER_WORKDIR).unwrap_or("");
+            let relative = relative.strip_prefix('/').unwrap_or(relative);
+            if relative.is_empty() {
+                workspace.clone()
+            } else {
+                workspace.join(relative)
+            }
+        } else {
+            PathBuf::from(cwd)
+        };
+
+        std::fs::create_dir_all(&actual_cwd)
+            .map_err(|e| VfsError::Io(format!("create cwd {}: {e}", actual_cwd.display())))?;
+
+        let output = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg(command)
+            .current_dir(&actual_cwd)
+            .output()
+            .await
+            .map_err(|e| VfsError::Io(format!("exec host command: {e}")))?;
+
+        Ok(ExecResult {
+            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+            exit_code: output.status.code().unwrap_or(-1),
+        })
+    }
+
+    async fn remove_container(&self, _container_id: &str) -> Result<(), VfsError> {
+        Ok(()) // noop — no container to remove
+    }
+}
+
+// =============================================================================
 // Containerd executor (default)
 // =============================================================================
 
@@ -354,20 +427,11 @@ impl ContainerdExecutor {
         let req = with_namespace!(req, CONTAINERD_NS);
 
         // Check if image exists and is already unpacked
-        if let Ok(resp) = images.get(req).await {
-            let image = resp.into_inner().image.unwrap_or_default();
-            // Check if snapshot exists for this image (means it's unpacked)
-            let mut snapshots = ctrd::services::v1::snapshots::snapshots_client::SnapshotsClient::new(self.channel.clone());
-            let identity = self.get_image_identity(&image).await;
-            if let Some(ref id) = identity {
-                let req = ctrd::services::v1::snapshots::StatSnapshotRequest {
-                    snapshotter: "overlayfs".to_string(),
-                    key: id.clone(),
-                };
-                let req = with_namespace!(req, CONTAINERD_NS);
-                if snapshots.stat(req).await.is_ok() {
-                    return Ok(()); // already pulled and unpacked
-                }
+        if images.get(req).await.is_ok() {
+            // Image record exists — check if a valid snapshot parent can be found
+            // (this means the image layers have been unpacked into the snapshotter)
+            if self.find_image_snapshot_parent().await.is_ok() {
+                return Ok(()); // already pulled and unpacked
             }
         }
 
@@ -403,16 +467,6 @@ impl ContainerdExecutor {
 
         println!("[logos] image {} ready", self.image);
         Ok(())
-    }
-
-    /// Get the identity (chain ID) of an image's top layer for use as snapshot parent.
-    async fn get_image_identity(&self, image: &ctrd::services::v1::Image) -> Option<String> {
-        // The image's target digest is the manifest descriptor
-        let target = image.target.as_ref()?;
-        let digest = &target.digest;
-        // containerd uses the image digest to create an identity snapshot
-        // The convention is: the image name itself is used as the snapshot key after unpack
-        Some(self.image.clone())
     }
 
     /// Find the snapshot parent key for the unpacked image.
