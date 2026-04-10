@@ -17,6 +17,9 @@ arrow-schema = "57"
 futures-util = "0.3"
 lancedb = "0.26"
 
+[target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
+tikv-jemallocator = "0.6"
+
 [build-dependencies]
 tonic-prost-build = "0.14.2"
 prost-build = "0.14.3"

@@ -24,6 +24,7 @@ const MAX_LIMIT: usize = 5;
 const MIN_ROWS_FOR_PQ_TRAINING: usize = 256;
 const LANCEDB_SESSIONS_TABLE: &str = "sessions";
 const LANCEDB_MSG_ID_TO_SESSION_ID_TABLE: &str = "msg_id_to_session_id";
+const LANCEDB_OPT_ENABLE_V2_MANIFEST_PATHS: &str = "new_table_enable_v2_manifest_paths";
 
 #[derive(Clone, Debug)]
 pub struct EmbeddingConfig {
@@ -125,23 +126,17 @@ impl SessionsStore {
             updated_at_unix: current_unix_timestamp()?,
         };
 
-        let delete_predicate = format!(
-            "session_id = '{}'",
-            escape_sql_literal(&record.session_id)
-        );
-        table
-            .delete(&delete_predicate)
-            .await
-            .map_err(|e| VfsError::Lance(format!("delete old session failed: {e}")))?;
-
         let batch = self.build_session_batch(&record)?;
         let schema = batch.schema();
         let source = RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema);
-        table
-            .add(Box::new(source))
-            .execute()
+        let mut merge = table.merge_insert(&["session_id"]);
+        merge
+            .when_matched_update_all(None)
+            .when_not_matched_insert_all();
+        merge
+            .execute(Box::new(source))
             .await
-            .map_err(|e| VfsError::Lance(format!("insert session failed: {e}")))?;
+            .map_err(|e| VfsError::Lance(format!("upsert session failed: {e}")))?;
         self.sync_msg_id_mappings(&record).await?;
         Ok(())
     }
@@ -242,6 +237,7 @@ impl SessionsStore {
         for batch in batches {
             results.extend(exact_results_from_batch(&batch)?);
         }
+        results.retain(|result| result_contains_exact_msg_id(result, msg_id));
         results.truncate(1);
         Ok(results)
     }
@@ -286,6 +282,7 @@ impl SessionsStore {
 
     async fn open_or_create_sessions_table(&self) -> Result<lancedb::Table, VfsError> {
         let db = lancedb::connect(&self.lancedb_uri)
+            .storage_option(LANCEDB_OPT_ENABLE_V2_MANIFEST_PATHS, "true")
             .execute()
             .await
             .map_err(|e| VfsError::Lance(format!("connect lancedb failed: {e}")))?;
@@ -308,6 +305,7 @@ impl SessionsStore {
 
     async fn open_or_create_msg_id_to_session_id_table(&self) -> Result<lancedb::Table, VfsError> {
         let db = lancedb::connect(&self.lancedb_uri)
+            .storage_option(LANCEDB_OPT_ENABLE_V2_MANIFEST_PATHS, "true")
             .execute()
             .await
             .map_err(|e| VfsError::Lance(format!("connect lancedb failed: {e}")))?;
@@ -487,18 +485,25 @@ impl SessionsStore {
 
     async fn sync_msg_id_mappings(&self, session: &SessionRecord) -> Result<(), VfsError> {
         let mapping_table = self.open_or_create_msg_id_to_session_id_table().await?;
-        let delete_predicate = format!("session_id = '{}'", escape_sql_literal(&session.session_id));
-        mapping_table
-            .delete(&delete_predicate)
-            .await
-            .map_err(|e| VfsError::Lance(format!("delete old msg_id mappings failed: {e}")))?;
-
         let mappings = build_msg_id_mapping_records(session)?;
         if mappings.is_empty() {
             return Ok(());
         }
 
-        let batch = self.build_msg_id_mapping_batch(&mappings)?;
+        // Append-only sync avoids delete+reinsert churn, which reduces Lance manifest
+        // growth and background cleanup pressure for frequently updated sessions.
+        let existing = self
+            .collect_existing_msg_ids_for_session(&mapping_table, &session.session_id)
+            .await?;
+        let new_mappings: Vec<MsgIdMappingRecord> = mappings
+            .into_iter()
+            .filter(|record| !existing.contains(&record.msg_id))
+            .collect();
+        if new_mappings.is_empty() {
+            return Ok(());
+        }
+
+        let batch = self.build_msg_id_mapping_batch(&new_mappings)?;
         let schema = batch.schema();
         let source = RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema);
         mapping_table
@@ -507,6 +512,36 @@ impl SessionsStore {
             .await
             .map_err(|e| VfsError::Lance(format!("insert msg_id mappings failed: {e}")))?;
         Ok(())
+    }
+
+    async fn collect_existing_msg_ids_for_session(
+        &self,
+        mapping_table: &lancedb::Table,
+        session_id: &str,
+    ) -> Result<HashSet<String>, VfsError> {
+        let filter = format!("session_id = '{}'", escape_sql_literal(session_id));
+        let stream = mapping_table
+            .query()
+            .only_if(filter)
+            .execute()
+            .await
+            .map_err(|e| VfsError::Lance(format!("query existing msg_id mappings failed: {e}")))?;
+        let batches: Vec<RecordBatch> = stream
+            .try_collect()
+            .await
+            .map_err(|e| VfsError::Lance(format!("collect existing msg_id mappings failed: {e}")))?;
+
+        let mut ids = HashSet::new();
+        for batch in batches {
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            let msg_ids = downcast_utf8_column(&batch, "msg_id")?;
+            for row in 0..batch.num_rows() {
+                ids.insert(msg_ids.value(row).to_string());
+            }
+        }
+        Ok(ids)
     }
 
     async fn find_session_id_by_msg_id(
@@ -684,6 +719,27 @@ fn build_msg_id_mapping_records(session: &SessionRecord) -> Result<Vec<MsgIdMapp
         }
     }
     Ok(mappings)
+}
+
+fn result_contains_exact_msg_id(result: &SearchResult, msg_id: &str) -> bool {
+    let (target_chat_id, target_message_id) = match msg_id.rsplit_once(':') {
+        Some((chat_id, message_id)) if !chat_id.trim().is_empty() && !message_id.trim().is_empty() => {
+            (chat_id.trim(), message_id.trim())
+        }
+        _ => return false,
+    };
+
+    result.messages.iter().any(|message| {
+        let message_id = message.message_id.trim();
+        if message_id.is_empty() || message_id != target_message_id {
+            return false;
+        }
+        let chat_id = message.chat_id.trim();
+        if chat_id.is_empty() {
+            return true;
+        }
+        chat_id == target_chat_id
+    })
 }
 
 fn stored_message_from_pb(msg: ChatMessage) -> StoredChatMessage {
