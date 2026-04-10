@@ -8,12 +8,12 @@
 //!
 //! L2 backend: LanceDB with vector embeddings via Ollama for semantic fallback.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow_array::types::Float32Type;
 use arrow_array::{
-    Array, FixedSizeListArray, Float32Array, RecordBatch, StringArray,
+    Array, FixedSizeListArray, Float32Array, RecordBatch, RecordBatchIterator, StringArray,
 };
 use arrow_schema::{DataType, Field, Schema};
 use futures::TryStreamExt;
@@ -22,6 +22,7 @@ use tokio::sync::Mutex;
 
 /// Embedding dimension — qwen3-embedding:0.6b produces 1024-dim vectors.
 const DEFAULT_EMBED_DIM: i32 = 1024;
+const LANCEDB_OPT_ENABLE_V2_MANIFEST_PATHS: &str = "new_table_enable_v2_manifest_paths";
 
 /// Similarity threshold for semantic fallback.
 /// Sessions with L2 distance below this are considered a match.
@@ -128,6 +129,7 @@ impl L2Store {
         embed_dim: i32,
     ) -> Result<Self, logos_vfs::VfsError> {
         let db = lancedb::connect(db_path)
+            .storage_option(LANCEDB_OPT_ENABLE_V2_MANIFEST_PATHS, "true")
             .execute()
             .await
             .map_err(|e| logos_vfs::VfsError::Io(format!("lancedb connect: {e}")))?;
@@ -234,11 +236,7 @@ impl L2Store {
             .map_err(|e| logos_vfs::VfsError::Io(format!("serialize: {e}")))?;
         let last_active = session.last_active.to_rfc3339();
 
-        // Delete existing row first (upsert)
         let table = self.open_sessions().await?;
-        let _ = table
-            .delete(&format!("session_id = '{}'", session.session_id))
-            .await;
 
         let dim = self.embed_dim as usize;
         if vector.len() != dim {
@@ -266,11 +264,15 @@ impl L2Store {
         )
         .map_err(|e| logos_vfs::VfsError::Io(format!("record batch: {e}")))?;
 
-        table
-            .add(vec![batch])
-            .execute()
+        let source = RecordBatchIterator::new(vec![Ok(batch)].into_iter(), self.sessions_schema());
+        let mut merge = table.merge_insert(&["session_id"]);
+        merge
+            .when_matched_update_all(None)
+            .when_not_matched_insert_all();
+        merge
+            .execute(Box::new(source))
             .await
-            .map_err(|e| logos_vfs::VfsError::Io(format!("lancedb add: {e}")))?;
+            .map_err(|e| logos_vfs::VfsError::Io(format!("lancedb upsert: {e}")))?;
 
         // Update msg_index
         self.update_msg_index(session).await?;
@@ -280,19 +282,22 @@ impl L2Store {
 
     async fn update_msg_index(&self, session: &Session) -> Result<(), logos_vfs::VfsError> {
         let idx_table = self.open_msg_index().await?;
-
-        // Delete old entries
-        for msg in &session.messages {
-            let _ = idx_table
-                .delete(&format!("msg_id = '{}'", msg.msg_id))
-                .await;
+        let existing = self
+            .collect_existing_msg_ids_for_session(&idx_table, &session.session_id)
+            .await?;
+        let new_msg_ids: Vec<i64> = session
+            .messages
+            .iter()
+            .map(|m| m.msg_id)
+            .filter(|msg_id| !existing.contains(msg_id))
+            .collect();
+        if new_msg_ids.is_empty() {
+            return Ok(());
         }
 
-        let msg_id_strings: Vec<String> =
-            session.messages.iter().map(|m| m.msg_id.to_string()).collect();
+        let msg_id_strings: Vec<String> = new_msg_ids.iter().map(|m| m.to_string()).collect();
         let msg_id_refs: Vec<&str> = msg_id_strings.iter().map(|s| s.as_str()).collect();
-        let sid_repeated: Vec<&str> = session
-            .messages
+        let sid_repeated: Vec<&str> = new_msg_ids
             .iter()
             .map(|_| session.session_id.as_str())
             .collect();
@@ -313,6 +318,40 @@ impl L2Store {
             .map_err(|e| logos_vfs::VfsError::Io(format!("msg_index add: {e}")))?;
 
         Ok(())
+    }
+
+    async fn collect_existing_msg_ids_for_session(
+        &self,
+        idx_table: &lancedb::Table,
+        session_id: &str,
+    ) -> Result<HashSet<i64>, logos_vfs::VfsError> {
+        let batches: Vec<RecordBatch> = idx_table
+            .query()
+            .only_if(format!("session_id = '{}'", session_id))
+            .execute()
+            .await
+            .map_err(|e| logos_vfs::VfsError::Io(format!("msg_index existing query: {e}")))?
+            .try_collect()
+            .await
+            .map_err(|e| logos_vfs::VfsError::Io(format!("msg_index existing collect: {e}")))?;
+
+        let mut ids = HashSet::new();
+        for batch in batches {
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            let msg_col = batch
+                .column_by_name("msg_id")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+            if let Some(arr) = msg_col {
+                for row in 0..batch.num_rows() {
+                    if let Ok(id) = arr.value(row).parse::<i64>() {
+                        ids.insert(id);
+                    }
+                }
+            }
+        }
+        Ok(ids)
     }
 
     async fn delete(&self, session_id: &str) -> Result<(), logos_vfs::VfsError> {
@@ -365,7 +404,13 @@ impl L2Store {
                     .and_then(|c| c.as_any().downcast_ref::<StringArray>());
                 if let Some(arr) = sid_col {
                     let sid = arr.value(0);
-                    return self.load_by_id(sid).await;
+                    let loaded = self.load_by_id(sid).await?;
+                    if let Some(ref session) = loaded {
+                        if session.messages.iter().any(|msg| msg.msg_id == msg_id) {
+                            return Ok(loaded);
+                        }
+                    }
+                    return Ok(None);
                 }
             }
         }
