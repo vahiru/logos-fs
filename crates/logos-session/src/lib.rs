@@ -28,6 +28,9 @@ const LANCEDB_OPT_ENABLE_V2_MANIFEST_PATHS: &str = "new_table_enable_v2_manifest
 /// Similarity threshold for semantic fallback.
 /// Sessions with L2 distance below this are considered a match.
 const SEMANTIC_THRESHOLD: f32 = 0.5;
+const RECENT_CHAT_ATTACH_WINDOW_SECS: i64 = 8;
+const LRU_ORDER_REBUILD_FACTOR: usize = 8;
+const LRU_ORDER_REBUILD_MIN_EXTRA: usize = 256;
 
 /// A reference to a message within a session.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -145,6 +148,20 @@ impl Inner {
         }
         false
     }
+
+    fn recent_session_id_for_chat(
+        &self,
+        chat_id: &str,
+        window: chrono::Duration,
+    ) -> Option<String> {
+        let cutoff = chrono::Utc::now() - window;
+        self.l0
+            .values()
+            .chain(self.l1.values())
+            .filter(|s| s.chat_id == chat_id && s.last_active >= cutoff)
+            .max_by_key(|s| s.last_active)
+            .map(|s| s.session_id.clone())
+    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -200,10 +217,15 @@ impl LruLayer {
             ticket,
             session_id: sid,
         }));
+        self.maybe_compact_order();
     }
 
     fn remove(&mut self, sid: &str) -> Option<Session> {
-        self.sessions.remove(sid).map(|slot| slot.session)
+        let removed = self.sessions.remove(sid).map(|slot| slot.session);
+        if self.sessions.is_empty() {
+            self.order.clear();
+        }
+        removed
     }
 
     fn get(&self, sid: &str) -> Option<&Session> {
@@ -228,23 +250,50 @@ impl LruLayer {
             ticket,
             session_id: sid.to_string(),
         }));
+        self.maybe_compact_order();
         true
     }
 
     fn pop_oldest(&mut self) -> Option<(String, Session)> {
+        self.maybe_compact_order();
         while let Some(Reverse(entry)) = self.order.pop() {
-            let Some(slot) = self.sessions.get(&entry.session_id) else {
+            let Some((sid, slot)) = self.sessions.remove_entry(&entry.session_id) else {
                 continue;
             };
             if slot.ticket != entry.ticket || slot.session.last_active != entry.last_active {
+                self.sessions.insert(sid, slot);
                 continue;
             }
-            let sid = entry.session_id;
-            if let Some(slot) = self.sessions.remove(&sid) {
-                return Some((sid, slot.session));
-            }
+            return Some((sid, slot.session));
         }
         None
+    }
+
+    fn maybe_compact_order(&mut self) {
+        let active = self.sessions.len();
+        if active == 0 {
+            self.order.clear();
+            return;
+        }
+
+        let heap_len = self.order.len();
+        let max_len = active.saturating_mul(LRU_ORDER_REBUILD_FACTOR);
+        let stale_estimate = heap_len.saturating_sub(active);
+        if heap_len > max_len && stale_estimate > LRU_ORDER_REBUILD_MIN_EXTRA {
+            self.rebuild_order();
+        }
+    }
+
+    fn rebuild_order(&mut self) {
+        let mut rebuilt = BinaryHeap::with_capacity(self.sessions.len());
+        for (sid, slot) in &self.sessions {
+            rebuilt.push(Reverse(LruEntry {
+                last_active: slot.session.last_active,
+                ticket: slot.ticket,
+                session_id: sid.clone(),
+            }));
+        }
+        self.order = rebuilt;
     }
 }
 // =============================================================================
@@ -697,22 +746,35 @@ impl SessionStore {
             }
         }
 
-        // Semantic fallback: when no reply_to and no page fault, try vector search
-        let semantic_match = if reply_to.is_none() && page_fault_session.is_none() {
-            if let Some(ref l2) = self.l2 {
-                match l2.semantic_search(&msg.text, &msg.chat_id).await {
-                    Ok(s) => s,
-                    Err(e) => {
-                        eprintln!("[logos-session] L2 semantic_search failed: {e}");
-                        None
-                    }
-                }
-            } else {
-                None
-            }
+        // Hot-path fast join: if this chat has a recent in-memory session, append directly
+        // and skip expensive semantic embedding search.
+        let recent_chat_sid = if reply_to.is_none() && page_fault_session.is_none() {
+            let inner = self.inner.lock().await;
+            inner.recent_session_id_for_chat(
+                &msg.chat_id,
+                chrono::Duration::seconds(RECENT_CHAT_ATTACH_WINDOW_SECS),
+            )
         } else {
             None
         };
+
+        // Semantic fallback: only when no reply_to, no page fault, and no recent in-memory hit.
+        let semantic_match =
+            if reply_to.is_none() && page_fault_session.is_none() && recent_chat_sid.is_none() {
+                if let Some(ref l2) = self.l2 {
+                    match l2.semantic_search(&msg.text, &msg.chat_id).await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            eprintln!("[logos-session] L2 semantic_search failed: {e}");
+                            None
+                        }
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
 
         // If semantic match found, delete from L2 (we'll promote to L0)
         if let Some(ref session) = semantic_match {
@@ -748,6 +810,19 @@ impl SessionStore {
                         inner.insert_l0(session);
                         Self::evict_collect(&mut inner)
                     }
+                } else {
+                    let chat_id = msg.chat_id.clone();
+                    let session = Session::new(&chat_id, msg);
+                    let sid = session.session_id.clone();
+                    inner.index_message(&sid, msg_id);
+                    inner.insert_l0(session);
+                    Self::evict_collect(&mut inner)
+                }
+            } else if let Some(sid) = recent_chat_sid {
+                // Same-chat burst: directly join recent active session to avoid per-message embed.
+                if inner.append_message_to_session(&sid, msg.clone()) {
+                    inner.index_message(&sid, msg_id);
+                    Self::evict_collect(&mut inner)
                 } else {
                     let chat_id = msg.chat_id.clone();
                     let session = Session::new(&chat_id, msg);
@@ -901,9 +976,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn no_reply_creates_separate_session() {
+    async fn no_reply_within_window_joins_recent_session() {
         let store = SessionStore::new(64, 256);
         store.observe(make_msg(1, "c1", None)).await;
+        store.observe(make_msg(2, "c1", None)).await;
+        let s1 = store.get_session_for_msg(1).await.unwrap();
+        let s2 = store.get_session_for_msg(2).await.unwrap();
+        assert_eq!(s1.session_id, s2.session_id);
+        assert_eq!(s1.messages.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn no_reply_outside_window_creates_separate_session() {
+        let store = SessionStore::new(64, 256);
+        store.observe(make_msg(1, "c1", None)).await;
+
+        // Force session age beyond fast-join window.
+        {
+            let mut inner = store.inner.lock().await;
+            let sid = inner.msg_index.get(&1).unwrap().clone();
+            if let Some(slot) = inner.l0.sessions.get_mut(&sid) {
+                slot.session.last_active = chrono::Utc::now()
+                    - chrono::Duration::seconds(RECENT_CHAT_ATTACH_WINDOW_SECS + 1);
+            }
+        }
+
         store.observe(make_msg(2, "c1", None)).await;
         let s1 = store.get_session_for_msg(1).await.unwrap();
         let s2 = store.get_session_for_msg(2).await.unwrap();
