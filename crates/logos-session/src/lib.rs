@@ -8,7 +8,8 @@
 //!
 //! L2 backend: LanceDB with vector embeddings via Ollama for semantic fallback.
 
-use std::collections::{HashMap, HashSet};
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow_array::types::Float32Type;
@@ -83,31 +84,169 @@ impl Session {
 }
 
 struct Inner {
-    msg_index: HashMap<i64, String>, // msg_id → session_id
-    l0: HashMap<String, Session>,
-    l1: HashMap<String, Session>,
+    msg_index: HashMap<i64, String>, // msg_id -> session_id
+    session_msg_ids: HashMap<String, HashSet<i64>>, // session_id -> msg_ids for O(k) cleanup
+    l0: LruLayer,
+    l1: LruLayer,
     l0_capacity: usize,
     l1_capacity: usize,
+    lru_ticket: u64,
 }
 
 impl Inner {
-    fn find_session_mut(&mut self, sid: &str) -> Option<(&mut Session, u8)> {
-        if let Some(s) = self.l0.get_mut(sid) {
-            return Some((s, 0));
-        }
-        if let Some(s) = self.l1.get_mut(sid) {
-            return Some((s, 1));
-        }
-        None
+    fn next_ticket(&mut self) -> u64 {
+        self.lru_ticket = self.lru_ticket.wrapping_add(1);
+        self.lru_ticket
     }
 
-    fn promote_to_l0(&mut self, sid: &str) {
-        if let Some(s) = self.l1.remove(sid) {
-            self.l0.insert(sid.to_string(), s);
+    fn index_session_messages(&mut self, session: &Session) {
+        let sid = session.session_id.clone();
+        let entry = self.session_msg_ids.entry(sid.clone()).or_default();
+        for m in &session.messages {
+            self.msg_index.insert(m.msg_id, sid.clone());
+            entry.insert(m.msg_id);
         }
+    }
+
+    fn index_message(&mut self, session_id: &str, msg_id: i64) {
+        self.msg_index.insert(msg_id, session_id.to_string());
+        self.session_msg_ids
+            .entry(session_id.to_string())
+            .or_default()
+            .insert(msg_id);
+    }
+
+    fn remove_session_from_index(&mut self, session_id: &str) {
+        if let Some(msg_ids) = self.session_msg_ids.remove(session_id) {
+            for msg_id in msg_ids {
+                self.msg_index.remove(&msg_id);
+            }
+        }
+    }
+
+    fn insert_l0(&mut self, session: Session) {
+        let sid = session.session_id.clone();
+        let ticket = self.next_ticket();
+        self.l0.insert(sid, session, ticket);
+    }
+
+    fn append_message_to_session(&mut self, sid: &str, msg: MsgRef) -> bool {
+        let ticket = self.next_ticket();
+        if self
+            .l0
+            .with_session_mut(sid, |session| session.add_message(msg.clone()), ticket)
+        {
+            return true;
+        }
+        if let Some(mut session) = self.l1.remove(sid) {
+            session.add_message(msg);
+            self.l0.insert(sid.to_string(), session, ticket);
+            return true;
+        }
+        false
     }
 }
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct LruEntry {
+    last_active: chrono::DateTime<chrono::Utc>,
+    ticket: u64,
+    session_id: String,
+}
+
+impl Ord for LruEntry {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.last_active
+            .cmp(&other.last_active)
+            .then_with(|| self.ticket.cmp(&other.ticket))
+            .then_with(|| self.session_id.cmp(&other.session_id))
+    }
+}
+
+impl PartialOrd for LruEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+struct LruSlot {
+    session: Session,
+    ticket: u64,
+}
+
+struct LruLayer {
+    sessions: HashMap<String, LruSlot>,
+    order: BinaryHeap<Reverse<LruEntry>>,
+}
+
+impl LruLayer {
+    fn new() -> Self {
+        Self {
+            sessions: HashMap::new(),
+            order: BinaryHeap::new(),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.sessions.len()
+    }
+
+    fn insert(&mut self, sid: String, session: Session, ticket: u64) {
+        let last_active = session.last_active;
+        self.sessions
+            .insert(sid.clone(), LruSlot { session, ticket });
+        self.order.push(Reverse(LruEntry {
+            last_active,
+            ticket,
+            session_id: sid,
+        }));
+    }
+
+    fn remove(&mut self, sid: &str) -> Option<Session> {
+        self.sessions.remove(sid).map(|slot| slot.session)
+    }
+
+    fn get(&self, sid: &str) -> Option<&Session> {
+        self.sessions.get(sid).map(|slot| &slot.session)
+    }
+
+    fn values(&self) -> impl Iterator<Item = &Session> {
+        self.sessions.values().map(|slot| &slot.session)
+    }
+
+    fn with_session_mut<F>(&mut self, sid: &str, mutator: F, ticket: u64) -> bool
+    where
+        F: FnOnce(&mut Session),
+    {
+        let Some(slot) = self.sessions.get_mut(sid) else {
+            return false;
+        };
+        mutator(&mut slot.session);
+        slot.ticket = ticket;
+        self.order.push(Reverse(LruEntry {
+            last_active: slot.session.last_active,
+            ticket,
+            session_id: sid.to_string(),
+        }));
+        true
+    }
+
+    fn pop_oldest(&mut self) -> Option<(String, Session)> {
+        while let Some(Reverse(entry)) = self.order.pop() {
+            let Some(slot) = self.sessions.get(&entry.session_id) else {
+                continue;
+            };
+            if slot.ticket != entry.ticket || slot.session.last_active != entry.last_active {
+                continue;
+            }
+            let sid = entry.session_id;
+            if let Some(slot) = self.sessions.remove(&sid) {
+                return Some((sid, slot.session));
+            }
+        }
+        None
+    }
+}
 // =============================================================================
 // L2 LanceDB Store
 // =============================================================================
@@ -282,22 +421,14 @@ impl L2Store {
 
     async fn update_msg_index(&self, session: &Session) -> Result<(), logos_vfs::VfsError> {
         let idx_table = self.open_msg_index().await?;
-        let existing = self
-            .collect_existing_msg_ids_for_session(&idx_table, &session.session_id)
-            .await?;
-        let new_msg_ids: Vec<i64> = session
-            .messages
-            .iter()
-            .map(|m| m.msg_id)
-            .filter(|msg_id| !existing.contains(msg_id))
-            .collect();
-        if new_msg_ids.is_empty() {
+        let msg_ids: Vec<i64> = session.messages.iter().map(|m| m.msg_id).collect();
+        if msg_ids.is_empty() {
             return Ok(());
         }
 
-        let msg_id_strings: Vec<String> = new_msg_ids.iter().map(|m| m.to_string()).collect();
+        let msg_id_strings: Vec<String> = msg_ids.iter().map(|m| m.to_string()).collect();
         let msg_id_refs: Vec<&str> = msg_id_strings.iter().map(|s| s.as_str()).collect();
-        let sid_repeated: Vec<&str> = new_msg_ids
+        let sid_repeated: Vec<&str> = msg_ids
             .iter()
             .map(|_| session.session_id.as_str())
             .collect();
@@ -311,47 +442,18 @@ impl L2Store {
         )
         .map_err(|e| logos_vfs::VfsError::Io(format!("msg_index batch: {e}")))?;
 
-        idx_table
-            .add(vec![idx_batch])
-            .execute()
+        let source =
+            RecordBatchIterator::new(vec![Ok(idx_batch)].into_iter(), self.msg_index_schema());
+        let mut merge = idx_table.merge_insert(&["msg_id"]);
+        merge
+            .when_matched_update_all(None)
+            .when_not_matched_insert_all();
+        merge
+            .execute(Box::new(source))
             .await
-            .map_err(|e| logos_vfs::VfsError::Io(format!("msg_index add: {e}")))?;
+            .map_err(|e| logos_vfs::VfsError::Io(format!("msg_index upsert: {e}")))?;
 
         Ok(())
-    }
-
-    async fn collect_existing_msg_ids_for_session(
-        &self,
-        idx_table: &lancedb::Table,
-        session_id: &str,
-    ) -> Result<HashSet<i64>, logos_vfs::VfsError> {
-        let batches: Vec<RecordBatch> = idx_table
-            .query()
-            .only_if(format!("session_id = '{}'", session_id))
-            .execute()
-            .await
-            .map_err(|e| logos_vfs::VfsError::Io(format!("msg_index existing query: {e}")))?
-            .try_collect()
-            .await
-            .map_err(|e| logos_vfs::VfsError::Io(format!("msg_index existing collect: {e}")))?;
-
-        let mut ids = HashSet::new();
-        for batch in batches {
-            if batch.num_rows() == 0 {
-                continue;
-            }
-            let msg_col = batch
-                .column_by_name("msg_id")
-                .and_then(|c| c.as_any().downcast_ref::<StringArray>());
-            if let Some(arr) = msg_col {
-                for row in 0..batch.num_rows() {
-                    if let Ok(id) = arr.value(row).parse::<i64>() {
-                        ids.insert(id);
-                    }
-                }
-            }
-        }
-        Ok(ids)
     }
 
     async fn delete(&self, session_id: &str) -> Result<(), logos_vfs::VfsError> {
@@ -509,10 +611,12 @@ impl SessionStore {
         Self {
             inner: Mutex::new(Inner {
                 msg_index: HashMap::new(),
-                l0: HashMap::new(),
-                l1: HashMap::new(),
+                session_msg_ids: HashMap::new(),
+                l0: LruLayer::new(),
+                l1: LruLayer::new(),
                 l0_capacity,
                 l1_capacity,
+                lru_ticket: 0,
             }),
             l2: None,
         }
@@ -543,10 +647,12 @@ impl SessionStore {
         Ok(Self {
             inner: Mutex::new(Inner {
                 msg_index: HashMap::new(),
-                l0: HashMap::new(),
-                l1: HashMap::new(),
+                session_msg_ids: HashMap::new(),
+                l0: LruLayer::new(),
+                l1: LruLayer::new(),
                 l0_capacity,
                 l1_capacity,
+                lru_ticket: 0,
             }),
             l2: Some(l2),
         })
@@ -623,54 +729,47 @@ impl SessionStore {
 
             if let Some(mut session) = page_fault_session {
                 // Page fault from L2: restore to L0
-                for m in &session.messages {
-                    inner.msg_index.insert(m.msg_id, session.session_id.clone());
-                }
+                inner.index_session_messages(&session);
                 session.add_message(msg.clone());
-                inner.msg_index.insert(msg_id, session.session_id.clone());
-                let sid = session.session_id.clone();
-                inner.l0.insert(sid, session);
+                inner.index_message(&session.session_id, msg_id);
+                inner.insert_l0(session);
                 Self::evict_collect(&mut inner)
             } else if let Some(reply_to) = reply_to {
                 // Reply chain: join existing in-memory session
                 if let Some(sid) = inner.msg_index.get(&reply_to).cloned() {
-                    let needs_promote = match inner.find_session_mut(&sid) {
-                        Some((session, layer)) => {
-                            session.add_message(msg);
-                            layer > 0
-                        }
-                        None => false,
-                    };
-                    if needs_promote {
-                        inner.promote_to_l0(&sid);
+                    if inner.append_message_to_session(&sid, msg.clone()) {
+                        inner.index_message(&sid, msg_id);
+                        Self::evict_collect(&mut inner)
+                    } else {
+                        let chat_id = msg.chat_id.clone();
+                        let session = Session::new(&chat_id, msg);
+                        let sid = session.session_id.clone();
+                        inner.index_message(&sid, msg_id);
+                        inner.insert_l0(session);
+                        Self::evict_collect(&mut inner)
                     }
-                    inner.msg_index.insert(msg_id, sid);
-                    Self::evict_collect(&mut inner)
                 } else {
                     let chat_id = msg.chat_id.clone();
                     let session = Session::new(&chat_id, msg);
                     let sid = session.session_id.clone();
-                    inner.msg_index.insert(msg_id, sid.clone());
-                    inner.l0.insert(sid, session);
+                    inner.index_message(&sid, msg_id);
+                    inner.insert_l0(session);
                     Self::evict_collect(&mut inner)
                 }
             } else if let Some(mut session) = semantic_match {
                 // Semantic fallback: matched an L2 session by vector similarity
-                for m in &session.messages {
-                    inner.msg_index.insert(m.msg_id, session.session_id.clone());
-                }
+                inner.index_session_messages(&session);
                 session.add_message(msg.clone());
-                inner.msg_index.insert(msg_id, session.session_id.clone());
-                let sid = session.session_id.clone();
-                inner.l0.insert(sid, session);
+                inner.index_message(&session.session_id, msg_id);
+                inner.insert_l0(session);
                 Self::evict_collect(&mut inner)
             } else {
                 // No reply, no semantic match: create new session
                 let chat_id = msg.chat_id.clone();
                 let session = Session::new(&chat_id, msg);
                 let sid = session.session_id.clone();
-                inner.msg_index.insert(msg_id, sid.clone());
-                inner.l0.insert(sid, session);
+                inner.index_message(&sid, msg_id);
+                inner.insert_l0(session);
                 Self::evict_collect(&mut inner)
             }
         };
@@ -679,7 +778,10 @@ impl SessionStore {
         if let Some(ref l2) = self.l2 {
             for session in evicted {
                 if let Err(e) = l2.persist(&session).await {
-                    eprintln!("[logos-session] L2 persist failed for {}: {e}", session.session_id);
+                    eprintln!(
+                        "[logos-session] L2 persist failed for {}: {e}",
+                        session.session_id
+                    );
                 }
             }
         }
@@ -687,31 +789,18 @@ impl SessionStore {
 
     fn evict_collect(inner: &mut Inner) -> Vec<Session> {
         while inner.l0.len() > inner.l0_capacity {
-            let oldest = inner
-                .l0
-                .iter()
-                .min_by_key(|(_, s)| s.last_active)
-                .map(|(k, _)| k.clone());
-            if let Some(key) = oldest {
-                if let Some(s) = inner.l0.remove(&key) {
-                    inner.l1.insert(key, s);
-                }
+            if let Some((sid, session)) = inner.l0.pop_oldest() {
+                let ticket = inner.next_ticket();
+                inner.l1.insert(sid, session, ticket);
             } else {
                 break;
             }
         }
         let mut evicted = Vec::new();
         while inner.l1.len() > inner.l1_capacity {
-            let oldest = inner
-                .l1
-                .iter()
-                .min_by_key(|(_, s)| s.last_active)
-                .map(|(k, _)| k.clone());
-            if let Some(key) = oldest {
-                if let Some(s) = inner.l1.remove(&key) {
-                    inner.msg_index.retain(|_, v| *v != key);
-                    evicted.push(s);
-                }
+            if let Some((sid, session)) = inner.l1.pop_oldest() {
+                inner.remove_session_from_index(&sid);
+                evicted.push(session);
             } else {
                 break;
             }
@@ -915,6 +1004,9 @@ mod tests {
         store.observe(msg2).await;
 
         let s = store.get_session_for_msg(20).await.unwrap();
-        println!("Semantic fallback: session has {} messages", s.messages.len());
+        println!(
+            "Semantic fallback: session has {} messages",
+            s.messages.len()
+        );
     }
 }
