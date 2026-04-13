@@ -232,6 +232,26 @@ FTS5 全文搜索。最多 50 条。
 
 组装 turn 上下文：当前 session、最新 short 摘要、发送者 persona 路径。给 runtime 在 agent 第一个 token 之前调用。
 
+### web_search
+
+```json
+{ "query": "twitter api oauth2 setup", "max_results": 3 }
+```
+
+多源网络搜索。并行查询 DuckDuckGo（通过系统 curl）、Wikipedia API、StackExchange API。返回 flat JSON 数组，每条包含 `source`（`web`/`wiki`/`so`）、`title`、`url`、`snippet`。每个源最多返回 `max_results` 条（默认 3）。单源失败静默跳过。
+
+### browse
+
+```json
+{ "url": "https://docs.x.com/...", "action": "snap" }
+```
+
+通过 [PinchTab](https://github.com/pinchtab/pinchtab) 控制浏览器。返回页面的 Accessibility Tree——紧凑的页面结构文本表示（每页约 800 tokens，远小于原始 HTML）。
+
+操作：`snap`（默认，读取页面树）、`click`（按 ref 点击元素）、`type`（按 ref 填入文本）。
+
+**需要安装 PinchTab**（`brew install pinchtab/tap/pinchtab`）。启动时未找到则静默跳过——agent 不会看到此工具。
+
 ## Session 聚类
 
 三层 LRU，拓扑优先：

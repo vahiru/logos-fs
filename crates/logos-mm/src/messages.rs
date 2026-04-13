@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use sqlx::SqlitePool;
 use sqlx::sqlite::SqlitePoolOptions;
-use tokio::sync::Mutex;
+use tokio::sync::RwLock;
 
 use logos_vfs::VfsError;
 
@@ -18,7 +18,7 @@ const FTS_MAX_LIMIT: i64 = 50;
 /// Schema follows RFC 003 §2.1.
 pub struct MessageDb {
     db_root: PathBuf,
-    pools: Mutex<HashMap<String, SqlitePool>>,
+    pools: RwLock<HashMap<String, SqlitePool>>,
 }
 
 impl MessageDb {
@@ -27,16 +27,19 @@ impl MessageDb {
             .map_err(|e| VfsError::Io(format!("create memory dir: {e}")))?;
         Ok(Self {
             db_root,
-            pools: Mutex::new(HashMap::new()),
+            pools: RwLock::new(HashMap::new()),
         })
     }
 
     /// Get or create a connection pool for a chat_id.
     pub(crate) async fn pool(&self, chat_id: &str) -> Result<SqlitePool, VfsError> {
-        let mut map = self.pools.lock().await;
-        if let Some(p) = map.get(chat_id) {
-            return Ok(p.clone());
+        {
+            let map = self.pools.read().await;
+            if let Some(p) = map.get(chat_id) {
+                return Ok(p.clone());
+            }
         }
+
         let db_path = self.db_root.join(format!("{chat_id}.db"));
         let url = format!("sqlite:{}?mode=rwc", db_path.display());
         let pool = SqlitePoolOptions::new()
@@ -45,6 +48,11 @@ impl MessageDb {
             .await
             .map_err(|e| VfsError::Sqlite(format!("open {}: {e}", db_path.display())))?;
         init_schema(&pool).await?;
+
+        let mut map = self.pools.write().await;
+        if let Some(existing) = map.get(chat_id) {
+            return Ok(existing.clone());
+        }
         map.insert(chat_id.to_string(), pool.clone());
         Ok(pool)
     }
