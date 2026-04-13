@@ -199,6 +199,26 @@ Two-level search: L1 = BM25 over anchor facts (FTS5), L2 = BM25 over task descri
 
 Assembles turn context: current session, latest short summary, sender persona paths. Intended to be called by runtime before the agent's first token.
 
+### web_search
+
+```json
+{ "query": "twitter api oauth2 setup", "max_results": 3 }
+```
+
+Multi-source web search. Queries DuckDuckGo (via system curl), Wikipedia API, and StackExchange API in parallel. Returns a flat JSON array with `source` (`web`/`wiki`/`so`), `title`, `url`, `snippet`. Each source returns up to `max_results` items (default 3). Single-source failures are silently skipped.
+
+### browse
+
+```json
+{ "url": "https://docs.x.com/...", "action": "snap" }
+```
+
+Browser control via [PinchTab](https://github.com/pinchtab/pinchtab). Returns the page's Accessibility Tree — a compact text representation of page structure (~800 tokens per page vs thousands for raw HTML).
+
+Actions: `snap` (default, read page tree), `click` (click element by ref), `type` (fill input by ref).
+
+**Requires PinchTab installed** (`brew install pinchtab/tap/pinchtab`). If not found at boot, the tool is silently omitted from the registry — agents won't see it.
+
 ## Session Clustering
 
 Three-layer LRU with topology-first design:
@@ -249,7 +269,9 @@ The scheduler also handles **plan dispatch**: scans for sleeping tasks with non-
 4. tmp/
 5. sandbox/ (containerd + overlayfs)
 6. proc/ (register built-in tools: memory.search, memory.range_fetch,
-          system.search_tasks, system.get_context, system.complete)
+          system.search_tasks, system.get_context, system.complete,
+          web_search, browse)
+6b. pinchtab (optional: spawn server, register browse tool if installed)
 7. proc-store/ (restore external tools, git clone/pull)
 8. services/ (restore from svc-store)
 9. svc-store/
