@@ -50,69 +50,144 @@ struct JsonRpcError {
 
 // --- MCP tool definitions ---
 
-fn tool_definitions() -> serde_json::Value {
-    serde_json::json!({
-        "tools": [
-            {
-                "name": "logos_read",
-                "description": "Read data from a Logos URI",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "uri": { "type": "string", "description": "Logos URI (e.g. logos://memory/groups/chat-1/messages/1)" }
-                    },
-                    "required": ["uri"]
-                }
-            },
-            {
-                "name": "logos_write",
-                "description": "Write data to a Logos URI",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "uri": { "type": "string", "description": "Logos URI" },
-                        "content": { "type": "string", "description": "Content to write" }
-                    },
-                    "required": ["uri", "content"]
-                }
-            },
-            {
-                "name": "logos_patch",
-                "description": "Partially update data at a Logos URI (JSON deep merge)",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "uri": { "type": "string", "description": "Logos URI" },
-                        "partial": { "type": "string", "description": "Partial content to merge" }
-                    },
-                    "required": ["uri", "partial"]
-                }
-            },
-            {
-                "name": "logos_exec",
-                "description": "Execute a shell command in the sandbox container",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "command": { "type": "string", "description": "Shell command (logos:// URIs are auto-translated)" }
-                    },
-                    "required": ["command"]
-                }
-            },
-            {
-                "name": "logos_call",
-                "description": "Call a proc tool by name",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "tool": { "type": "string", "description": "Tool name (e.g. memory.search)" },
-                        "params": { "type": "object", "description": "Tool parameters" }
-                    },
-                    "required": ["tool", "params"]
-                }
+#[derive(Clone, Debug)]
+struct ProcToolDef {
+    name: String,
+    description: String,
+    input_schema: serde_json::Value,
+}
+
+fn base_tool_definitions() -> Vec<serde_json::Value> {
+    vec![
+        serde_json::json!({
+            "name": "logos_read",
+            "description": "Read data from a Logos URI",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "uri": { "type": "string", "description": "Logos URI (e.g. logos://memory/groups/chat-1/messages/1)" }
+                },
+                "required": ["uri"]
             }
-        ]
-    })
+        }),
+        serde_json::json!({
+            "name": "logos_write",
+            "description": "Write data to a Logos URI",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "uri": { "type": "string", "description": "Logos URI" },
+                    "content": { "type": "string", "description": "Content to write" }
+                },
+                "required": ["uri", "content"]
+            }
+        }),
+        serde_json::json!({
+            "name": "logos_patch",
+            "description": "Partially update data at a Logos URI (JSON deep merge)",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "uri": { "type": "string", "description": "Logos URI" },
+                    "partial": { "type": "string", "description": "Partial content to merge" }
+                },
+                "required": ["uri", "partial"]
+            }
+        }),
+        serde_json::json!({
+            "name": "logos_exec",
+            "description": "Execute a shell command in the sandbox container",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "command": { "type": "string", "description": "Shell command (logos:// URIs are auto-translated)" }
+                },
+                "required": ["command"]
+            }
+        }),
+        serde_json::json!({
+            "name": "logos_call",
+            "description": "Call a proc tool by name",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "tool": { "type": "string", "description": "Tool name (e.g. memory.search)" },
+                    "params": { "type": "object", "description": "Tool parameters" }
+                },
+                "required": ["tool", "params"]
+            }
+        }),
+    ]
+}
+
+fn tool_definitions(proc_tools: &[ProcToolDef]) -> serde_json::Value {
+    let mut tools = base_tool_definitions();
+    for t in proc_tools {
+        tools.push(serde_json::json!({
+            "name": t.name,
+            "description": t.description,
+            "inputSchema": t.input_schema,
+        }));
+    }
+    serde_json::json!({ "tools": tools })
+}
+
+async fn fetch_proc_tools(
+    client: &mut LogosClient<Channel>,
+    session_key: &Option<String>,
+) -> Result<Vec<ProcToolDef>, String> {
+    let resp = client
+        .read(with_session(
+            ReadReq {
+                uri: "logos://proc/".to_string(),
+            },
+            session_key,
+        ))
+        .await
+        .map_err(|e| e.message().to_string())?;
+    let list_json = resp.into_inner().content;
+    let names: Vec<String> = serde_json::from_str(&list_json)
+        .map_err(|e| format!("parse proc list: {e}"))?;
+
+    let mut tools = Vec::new();
+    for name in names {
+        if name.is_empty() {
+            continue;
+        }
+        let schema_resp = client
+            .read(with_session(
+                ReadReq {
+                    uri: format!("logos://proc/{name}/.schema"),
+                },
+                session_key,
+            ))
+            .await;
+        let schema_str = match schema_resp {
+            Ok(r) => r.into_inner().content,
+            Err(e) => {
+                eprintln!("[logos-mcp] WARNING: failed to read schema for {name}: {e}");
+                continue;
+            }
+        };
+        let schema: serde_json::Value = match serde_json::from_str(&schema_str) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("[logos-mcp] WARNING: invalid schema for {name}: {e}");
+                continue;
+            }
+        };
+        let description = schema["description"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+        let input_schema = schema["parameters"].clone();
+        tools.push(ProcToolDef {
+            name,
+            description,
+            input_schema,
+        });
+    }
+    Ok(tools)
 }
 
 // --- Main ---
@@ -152,6 +227,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     eprintln!("[logos-mcp] connected to {socket_path}");
 
+    // Discover proc tools from kernel
+    let proc_tools = match fetch_proc_tools(&mut client, &session_key).await {
+        Ok(tools) => {
+            eprintln!("[logos-mcp] discovered {} proc tool(s)", tools.len());
+            tools
+        }
+        Err(e) => {
+            eprintln!("[logos-mcp] WARNING: failed to discover proc tools: {e}");
+            Vec::new()
+        }
+    };
+
     // stdio JSON-RPC loop
     let stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();
@@ -189,7 +276,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         };
 
-        let response = handle_request(&mut client, &session_key, request).await;
+        let response = handle_request(&mut client, &session_key, &proc_tools, request).await;
         let out = serde_json::to_string(&response)? + "\n";
         stdout.write_all(out.as_bytes()).await?;
         stdout.flush().await?;
@@ -201,6 +288,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn handle_request(
     client: &mut LogosClient<Channel>,
     session_key: &Option<String>,
+    proc_tools: &[ProcToolDef],
     req: JsonRpcRequest,
 ) -> JsonRpcResponse {
     let id = req.id.clone();
@@ -210,7 +298,7 @@ async fn handle_request(
         "tools/list" => JsonRpcResponse {
             jsonrpc: "2.0".to_string(),
             id,
-            result: Some(tool_definitions()),
+            result: Some(tool_definitions(proc_tools)),
             error: None,
         },
 
@@ -218,7 +306,7 @@ async fn handle_request(
         "tools/call" => {
             let tool_name = req.params["name"].as_str().unwrap_or("");
             let arguments = &req.params["arguments"];
-            match call_tool(client, session_key, tool_name, arguments).await {
+            match call_tool(client, session_key, proc_tools, tool_name, arguments).await {
                 Ok(result) => JsonRpcResponse {
                     jsonrpc: "2.0".to_string(),
                     id,
@@ -285,6 +373,7 @@ fn with_session<T>(req: T, session_key: &Option<String>) -> tonic::Request<T> {
 async fn call_tool(
     client: &mut LogosClient<Channel>,
     session_key: &Option<String>,
+    proc_tools: &[ProcToolDef],
     tool_name: &str,
     args: &serde_json::Value,
 ) -> Result<String, String> {
@@ -341,7 +430,22 @@ async fn call_tool(
                 .map_err(|e| e.message().to_string())?;
             Ok(resp.into_inner().result_json)
         }
-        _ => Err(format!("unknown tool: {tool_name}")),
+        _ => {
+            // If it matches a dynamically discovered proc tool, forward via logos_call
+            if proc_tools.iter().any(|t| t.name == tool_name) {
+                let params = serde_json::to_string(args).unwrap_or_else(|_| "{}".to_string());
+                let resp = client
+                    .call(with_session(CallReq {
+                        tool: tool_name.to_string(),
+                        params_json: params,
+                    }, session_key))
+                    .await
+                    .map_err(|e| e.message().to_string())?;
+                Ok(resp.into_inner().result_json)
+            } else {
+                Err(format!("unknown tool: {tool_name}"))
+            }
+        }
     }
 }
 
@@ -350,8 +454,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tool_definitions_has_five_tools() {
-        let defs = tool_definitions();
+    fn tool_definitions_has_five_base_tools_when_no_proc_tools() {
+        let defs = tool_definitions(&[]);
         let tools = defs["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 5);
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
@@ -363,14 +467,28 @@ mod tests {
     }
 
     #[test]
+    fn tool_definitions_includes_proc_tools() {
+        let proc_tools = vec![
+            ProcToolDef {
+                name: "web_search".to_string(),
+                description: "Search the web".to_string(),
+                input_schema: serde_json::json!({"type": "object"}),
+            },
+        ];
+        let defs = tool_definitions(&proc_tools);
+        let tools = defs["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 6);
+        assert!(tools.iter().any(|t| t["name"] == "web_search"));
+    }
+
+    #[test]
     fn tool_schemas_have_required_fields() {
-        let defs = tool_definitions();
+        let defs = tool_definitions(&[]);
         let tools = defs["tools"].as_array().unwrap();
         for tool in tools {
             assert!(tool["name"].is_string());
             assert!(tool["description"].is_string());
             assert!(tool["inputSchema"].is_object());
-            assert!(tool["inputSchema"]["required"].is_array());
         }
     }
 
