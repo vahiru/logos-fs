@@ -541,7 +541,7 @@ impl L2Metrics {
         let sem_max = load(&self.latency_ms_max, L2Op::SemanticSearch);
 
         eprintln!(
-            "[logos-session][metrics] calls[persist={},delete={},id={},msg={},semantic={}] errs[persist={},delete={},id={},msg={},semantic={}] hits[id={}/{},msg={}/{},semantic={}/{}] avg_ms[persist={:.2},delete={:.2},id={:.2},msg={:.2},semantic={:.2}] max_ms[persist={},delete={},id={},msg={},semantic={}] sem_wait[count={},avg_ms={:.2},p50<={},p95<={},max_ms={}]",
+            "[logos-session][metrics][lifetime] calls[persist={},delete={},id={},msg={},semantic={}] errs[persist={},delete={},id={},msg={},semantic={}] hits[id={}/{},msg={}/{},semantic={}/{}] avg_ms[persist={:.2},delete={:.2},id={:.2},msg={:.2},semantic={:.2}] max_ms[persist={},delete={},id={},msg={},semantic={}] sem_wait[count={},avg_ms={:.2},p50_upper_ms<={},p95_upper_ms<={},max_ms={}]",
             p_calls,
             d_calls,
             id_calls,
@@ -633,6 +633,7 @@ impl L2Store {
         let msg_index_schema = Self::build_msg_index_schema();
         Self::ensure_tables(&db, &sessions_schema, &msg_index_schema).await?;
 
+        // Keep table handles open for process lifetime to avoid repeated open_table metadata syscalls.
         let sessions_table = db
             .open_table("sessions")
             .execute()
@@ -1082,7 +1083,7 @@ impl L2Store {
                 .msg_index_table
                 .query()
                 .select(Select::columns(&["session_id"]))
-                .only_if(format!("msg_id = '{}'", msg_id))
+                .only_if(format!("msg_id = {}", Self::sql_quote(&msg_id.to_string())))
                 .limit(1)
                 .execute_with_options(Self::small_query_options())
                 .await
