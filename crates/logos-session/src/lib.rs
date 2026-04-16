@@ -82,11 +82,17 @@ impl Session {
 
     /// Concatenate all message texts for embedding.
     fn text_for_embed(&self) -> String {
-        self.messages
+        let joined = self.messages
             .iter()
-            .map(|m| m.text.as_str())
+            .map(|m| m.text.trim())
+            .filter(|text| !text.is_empty())
             .collect::<Vec<_>>()
-            .join("\n")
+            .join("\n");
+        if joined.is_empty() {
+            "(empty)".to_string()
+        } else {
+            joined
+        }
     }
 }
 
@@ -880,9 +886,17 @@ impl L2Store {
     /// Call Ollama embedding API.
     async fn embed(&self, text: &str) -> Result<Vec<f32>, logos_vfs::VfsError> {
         let url = format!("{}/api/embed", self.ollama_url);
+        let input = {
+            let normalized = text.trim();
+            if normalized.is_empty() {
+                "(empty)"
+            } else {
+                normalized
+            }
+        };
         let body = serde_json::json!({
             "model": self.model,
-            "input": text,
+            "input": input,
         });
 
         let resp = self
@@ -893,19 +907,64 @@ impl L2Store {
             .await
             .map_err(|e| logos_vfs::VfsError::Io(format!("ollama request: {e}")))?;
 
-        let json: serde_json::Value = resp
-            .json()
+        let status = resp.status();
+        let raw = resp
+            .text()
             .await
-            .map_err(|e| logos_vfs::VfsError::Io(format!("ollama response: {e}")))?;
+            .map_err(|e| logos_vfs::VfsError::Io(format!("ollama response body: {e}")))?;
+        if !status.is_success() {
+            return Err(logos_vfs::VfsError::Io(format!(
+                "ollama embed failed status={} body={}",
+                status,
+                Self::truncate_for_log(&raw, 240)
+            )));
+        }
 
-        let vec = json["embeddings"][0]
-            .as_array()
-            .ok_or_else(|| logos_vfs::VfsError::Io("ollama: no embeddings in response".into()))?
+        let json: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
+            logos_vfs::VfsError::Io(format!(
+                "ollama response json parse failed: {e}; body={}",
+                Self::truncate_for_log(&raw, 240)
+            ))
+        })?;
+
+        let embedding = json
+            .get("embeddings")
+            .and_then(|value| value.as_array())
+            .and_then(|rows| rows.first())
+            .and_then(|first| first.as_array())
+            .or_else(|| json.get("embedding").and_then(|value| value.as_array()))
+            .ok_or_else(|| {
+                logos_vfs::VfsError::Io(format!(
+                    "ollama: no embeddings in response body={}",
+                    Self::truncate_for_log(&raw, 240)
+                ))
+            })?;
+
+        if embedding.is_empty() {
+            return Err(logos_vfs::VfsError::Io(format!(
+                "ollama: empty embedding in response body={}",
+                Self::truncate_for_log(&raw, 240)
+            )));
+        }
+
+        let vec = embedding
             .iter()
             .map(|v| v.as_f64().unwrap_or(0.0) as f32)
             .collect();
 
         Ok(vec)
+    }
+
+    fn truncate_for_log(text: &str, max_chars: usize) -> String {
+        if text.chars().count() <= max_chars {
+            return text.to_string();
+        }
+        let mut end = 0usize;
+        for (idx, _) in text.char_indices().take(max_chars) {
+            end = idx;
+        }
+        let prefix = if end == 0 { "" } else { &text[..end] };
+        format!("{prefix}...(truncated)")
     }
 
     async fn persist(&self, session: &Session) -> Result<(), logos_vfs::VfsError> {
