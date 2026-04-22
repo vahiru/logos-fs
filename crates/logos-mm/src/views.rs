@@ -44,7 +44,7 @@ impl MemoryView for BySpeakerView {
         let limit = val["limit"].as_i64().unwrap_or(20).clamp(1, 200);
 
         let rows = sqlx::query(
-            "SELECT msg_id, ts, chat_id, speaker, reply_to, text, mentions
+            "SELECT msg_id, ts, chat_id, speaker, reply_to, text, mentions, meta
              FROM messages WHERE chat_id = ?1 AND speaker = ?2
              ORDER BY msg_id DESC LIMIT ?3",
         )
@@ -65,6 +65,8 @@ impl MemoryView for BySpeakerView {
                     "speaker": row.get::<String, _>("speaker"),
                     "text": row.get::<String, _>("text"),
                     "reply_to": row.get::<Option<i64>, _>("reply_to"),
+                    "mentions": row.get::<Option<String>, _>("mentions"),
+                    "meta": parse_json_column(row.get::<Option<String>, _>("meta")),
                 })
             })
             .collect();
@@ -97,7 +99,7 @@ impl MemoryView for RecentView {
         let limit = val["limit"].as_i64().unwrap_or(20).clamp(1, 200);
 
         let rows = sqlx::query(
-            "SELECT msg_id, ts, chat_id, speaker, reply_to, text, mentions
+            "SELECT msg_id, ts, chat_id, speaker, reply_to, text, mentions, meta
              FROM messages WHERE chat_id = ?1
              ORDER BY msg_id DESC LIMIT ?2",
         )
@@ -117,10 +119,23 @@ impl MemoryView for RecentView {
                     "speaker": row.get::<String, _>("speaker"),
                     "text": row.get::<String, _>("text"),
                     "reply_to": row.get::<Option<i64>, _>("reply_to"),
+                    "mentions": row.get::<Option<String>, _>("mentions"),
+                    "meta": parse_json_column(row.get::<Option<String>, _>("meta")),
                 })
             })
             .collect();
 
         Ok(serde_json::to_string(&results).unwrap_or_else(|_| "[]".to_string()))
     }
+}
+
+fn parse_json_column(value: Option<String>) -> serde_json::Value {
+    let Some(raw) = value else {
+        return serde_json::Value::Null;
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return serde_json::Value::Null;
+    }
+    serde_json::from_str(trimmed).unwrap_or(serde_json::Value::Null)
 }

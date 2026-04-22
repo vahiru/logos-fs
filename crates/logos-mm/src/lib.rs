@@ -241,13 +241,16 @@ mod tests {
     #[tokio::test]
     async fn insert_and_get_message() {
         let (mm, _dir) = test_mm().await;
-        let msg = r#"{"ts":"2026-03-20T10:00:00Z","speaker":"alice","text":"hello","reply_to":null}"#;
+        let msg = r#"{"ts":"2026-03-20T10:00:00Z","speaker":"alice","text":"hello","reply_to":null,"meta":{"username":"Alice","senderEntityType":"user","replyToUserId":"bob"}}"#;
         mm.write(&["groups", "chat-1", "messages"], msg).await.unwrap();
 
         let result = mm.read(&["groups", "chat-1", "messages", "1"]).await.unwrap();
         let val: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(val["speaker"], "alice");
         assert_eq!(val["text"], "hello");
+        assert_eq!(val["meta"]["username"], "Alice");
+        assert_eq!(val["meta"]["senderEntityType"], "user");
+        assert_eq!(val["meta"]["replyToUserId"], "bob");
     }
 
     #[tokio::test]
