@@ -22,6 +22,7 @@ use arrow_schema::{DataType, Field, Schema};
 use futures::TryStreamExt;
 use lancedb::index::Index;
 use lancedb::query::{ExecutableQuery, QueryBase, QueryExecutionOptions, Select};
+use lancedb::table::{Duration as LanceDuration, OptimizeAction};
 use tokio::sync::{RwLock, Semaphore};
 
 /// Embedding dimension — qwen3-embedding:0.6b produces 1024-dim vectors.
@@ -620,6 +621,7 @@ struct L2Store {
     http: reqwest::Client,
     l2_sem: Semaphore,
     metrics: L2Metrics,
+    l2_prune_last_run_sec: AtomicU64,
 }
 
 impl L2Store {
@@ -664,6 +666,7 @@ impl L2Store {
             http: reqwest::Client::new(),
             l2_sem: Semaphore::new(l2_max_concurrency),
             metrics: L2Metrics::new(),
+            l2_prune_last_run_sec: AtomicU64::new(0),
         };
 
         if let Err(e) = store.ensure_indexes().await {
@@ -833,6 +836,128 @@ impl L2Store {
                 .filter(|v| *v > 0)
                 .unwrap_or(auto)
         })
+    }
+
+    fn parse_bool_env(name: &str) -> Option<bool> {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| match value.trim().to_ascii_lowercase().as_str() {
+                "1" | "true" | "yes" | "on" => Some(true),
+                "0" | "false" | "no" | "off" => Some(false),
+                _ => None,
+            })
+    }
+
+    fn l2_prune_enabled() -> bool {
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED
+            .get_or_init(|| Self::parse_bool_env("LOGOS_SESSION_L2_PRUNE_ENABLED").unwrap_or(true))
+    }
+
+    fn l2_prune_interval_secs() -> u64 {
+        static INTERVAL_SECS: OnceLock<u64> = OnceLock::new();
+        *INTERVAL_SECS.get_or_init(|| {
+            std::env::var("LOGOS_SESSION_L2_PRUNE_INTERVAL_SECS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .filter(|v| *v >= 60)
+                .unwrap_or(1800)
+        })
+    }
+
+    fn l2_prune_retention_hours() -> i64 {
+        static RETENTION_HOURS: OnceLock<i64> = OnceLock::new();
+        *RETENTION_HOURS.get_or_init(|| {
+            std::env::var("LOGOS_SESSION_L2_PRUNE_RETENTION_HOURS")
+                .ok()
+                .and_then(|v| v.parse::<i64>().ok())
+                .filter(|v| *v > 0)
+                .unwrap_or(24)
+        })
+    }
+
+    fn l2_prune_delete_unverified() -> Option<bool> {
+        static DELETE_UNVERIFIED: OnceLock<Option<bool>> = OnceLock::new();
+        *DELETE_UNVERIFIED
+            .get_or_init(|| Self::parse_bool_env("LOGOS_SESSION_L2_PRUNE_DELETE_UNVERIFIED"))
+    }
+
+    async fn maybe_prune_old_versions(&self) {
+        if !Self::l2_prune_enabled() {
+            return;
+        }
+
+        let now = chrono::Utc::now().timestamp();
+        if now <= 0 {
+            return;
+        }
+
+        let now = now as u64;
+        let interval_secs = Self::l2_prune_interval_secs();
+        let last_run = self.l2_prune_last_run_sec.load(Ordering::Relaxed);
+        if now.saturating_sub(last_run) < interval_secs {
+            return;
+        }
+
+        if self
+            .l2_prune_last_run_sec
+            .compare_exchange(last_run, now, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+
+        let retention_hours = Self::l2_prune_retention_hours();
+        let delete_unverified = Self::l2_prune_delete_unverified();
+
+        Self::prune_table_versions(
+            &self.sessions_table,
+            "sessions",
+            retention_hours,
+            delete_unverified,
+        )
+        .await;
+        Self::prune_table_versions(
+            &self.msg_index_table,
+            "msg_index",
+            retention_hours,
+            delete_unverified,
+        )
+        .await;
+    }
+
+    async fn prune_table_versions(
+        table: &lancedb::Table,
+        table_name: &str,
+        retention_hours: i64,
+        delete_unverified: Option<bool>,
+    ) {
+        let Some(older_than) = LanceDuration::try_hours(retention_hours) else {
+            eprintln!(
+                "[logos-session] WARNING: invalid prune retention hours={retention_hours}"
+            );
+            return;
+        };
+
+        let action = OptimizeAction::Prune {
+            older_than: Some(older_than),
+            delete_unverified,
+            error_if_tagged_old_versions: Some(false),
+        };
+
+        match table.optimize(action).await {
+            Ok(stats) => {
+                if let Some(prune) = stats.prune {
+                    eprintln!(
+                        "[logos-session] L2 prune table={} old_versions_removed={} bytes_removed={}",
+                        table_name, prune.old_versions, prune.bytes_removed
+                    );
+                }
+            }
+            Err(e) => {
+                eprintln!("[logos-session] WARNING: L2 prune failed table={table_name}: {e}");
+            }
+        }
     }
 
     async fn acquire_l2_permit(
@@ -1020,6 +1145,10 @@ impl L2Store {
             Ok(())
         }
         .await;
+        drop(_permit);
+        if result.is_ok() {
+            self.maybe_prune_old_versions().await;
+        }
 
         let elapsed_ms = started.elapsed().as_millis() as u64;
         self.metrics
@@ -1081,6 +1210,10 @@ impl L2Store {
             Ok(())
         }
         .await;
+        drop(_permit);
+        if result.is_ok() {
+            self.maybe_prune_old_versions().await;
+        }
 
         let elapsed_ms = started.elapsed().as_millis() as u64;
         self.metrics
