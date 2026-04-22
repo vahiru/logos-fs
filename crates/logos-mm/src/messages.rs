@@ -60,7 +60,7 @@ impl MessageDb {
     /// Insert a message. Returns the new msg_id.
     ///
     /// `content` is a JSON object with fields:
-    /// `ts`, `chat_id`, `speaker`, `reply_to` (msg_id integer), `text`, `mentions`
+    /// `ts`, `chat_id`, `actor_id|speaker`, `reply_to` (msg_id integer), `text`, `mentions`
     ///
     /// RFC 003 §2.1
     pub async fn insert(&self, chat_id: &str, content: &str) -> Result<i64, VfsError> {
@@ -70,7 +70,11 @@ impl MessageDb {
 
         let now = now_iso8601();
         let ts = val["ts"].as_str().unwrap_or(&now).to_string();
-        let speaker = val["speaker"].as_str().unwrap_or_default().to_string();
+        let speaker = val["actor_id"]
+            .as_str()
+            .or_else(|| val["speaker"].as_str())
+            .unwrap_or_default()
+            .to_string();
         let text = val["text"].as_str().unwrap_or_default().to_string();
         let mentions = val["mentions"]
             .as_array()
@@ -215,6 +219,7 @@ fn msg_row_to_json(row: &sqlx::sqlite::SqliteRow) -> serde_json::Value {
         "msg_id": row.get::<i64, _>("msg_id"),
         "ts": row.get::<String, _>("ts"),
         "chat_id": row.get::<String, _>("chat_id"),
+        "actor_id": row.get::<String, _>("speaker"),
         "speaker": row.get::<String, _>("speaker"),
         "reply_to": row.get::<Option<i64>, _>("reply_to"),
         "text": row.get::<String, _>("text"),
