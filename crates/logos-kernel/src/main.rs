@@ -190,7 +190,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o777));
+            // 0o660: owner+group read/write only; avoids world-accessible socket.
+            let _ = std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o660));
         }
         println!("[logos] listening on unix://{}", socket_path.display());
         Server::builder()

@@ -137,11 +137,27 @@ impl SandboxNs {
         std::fs::create_dir_all(&task_dir)
             .map_err(|e| VfsError::Io(format!("create task dir {task_id}: {e}")))?;
 
-        if path.len() > 1 {
-            Ok(task_dir.join(path[1..].join("/")))
+        let resolved = if path.len() > 1 {
+            task_dir.join(path[1..].join("/"))
         } else {
-            Ok(task_dir)
+            task_dir.clone()
+        };
+
+        // Canonicalize to prevent path traversal. The task_dir itself may not yet
+        // contain subdirs, so we canonicalize the task_dir anchor separately.
+        let canonical_task_dir = task_dir
+            .canonicalize()
+            .map_err(|e| VfsError::Io(format!("canonicalize task dir: {e}")))?;
+        // For paths that don't exist yet, walk up until we find an existing prefix.
+        let canonical_resolved = canonicalize_partial(&resolved)
+            .map_err(|e| VfsError::Io(format!("canonicalize path: {e}")))?;
+        if !canonical_resolved.starts_with(&canonical_task_dir) {
+            return Err(VfsError::InvalidPath(format!(
+                "path escapes task directory: {}",
+                resolved.display()
+            )));
         }
+        Ok(resolved)
     }
 
     /// Pre-create a container and register task → agent mapping.
@@ -833,15 +849,15 @@ impl SandboxExecutor for ContainerdExecutor {
             let _ = tokio::fs::OpenOptions::new().write(true).open(si).await;
         });
 
-        // Build exec process spec
-        // Ensure task dir exists inside container, then cd into it
-        let full_cmd = format!("mkdir -p {cwd} && cd {cwd} && {command}");
+        // Build exec process spec.
+        // Use the OCI process `cwd` field instead of embedding cwd in the shell
+        // command string, which would allow injection via a crafted task_id.
         let process_spec = serde_json::json!({
             "terminal": false,
             "user": {"uid": 0, "gid": 0},
-            "args": ["sh", "-c", full_cmd],
+            "args": ["sh", "-c", command],
             "env": ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"],
-            "cwd": "/"
+            "cwd": cwd
         });
         let spec = Any {
             type_url: "types.containerd.io/opencontainers/runtime-spec/1/Process".to_string(),
@@ -990,6 +1006,39 @@ fn create_fifo(path: &std::path::Path) -> Result<(), VfsError> {
         )));
     }
     Ok(())
+}
+
+// =============================================================================
+// Helpers
+// =============================================================================
+
+/// Canonicalize a path that may not fully exist yet.
+/// Walks up the ancestor chain until we find an existing prefix, canonicalizes
+/// that, then re-appends the remaining non-existent suffix.  This lets us check
+/// containment even for paths that will be created later.
+fn canonicalize_partial(path: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
+    // Try the full path first (cheap path: already exists).
+    if let Ok(c) = path.canonicalize() {
+        return Ok(c);
+    }
+    // Walk up until we find an existing ancestor.
+    let mut existing = path.to_path_buf();
+    let mut suffix = std::path::PathBuf::new();
+    loop {
+        if existing.exists() {
+            let canonical = existing.canonicalize()?;
+            return Ok(canonical.join(suffix));
+        }
+        match existing.file_name() {
+            Some(name) => {
+                let name = name.to_owned();
+                existing.pop();
+                // Prepend name to suffix
+                suffix = std::path::Path::new(&name).join(&suffix);
+            }
+            None => return Err(std::io::Error::new(std::io::ErrorKind::NotFound, "no existing ancestor")),
+        }
+    }
 }
 
 // =============================================================================
